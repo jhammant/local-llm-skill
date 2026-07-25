@@ -1,0 +1,16 @@
+{
+  "name": "local-llm",
+  "version": "1.0.0",
+  "description": "A memory-aware batch inference worker for LM Studio",
+  "type": "module",
+  "bin": {
+    "local-llm": "src/cli.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
