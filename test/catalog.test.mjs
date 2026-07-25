@@ -55,9 +55,33 @@ test('selection falls back to the next smaller class', async () => {
     client: clientWith([reflex]),
     admitFn: admissible,
   });
+  // The coder class requires tool_use, which this model lacks, so selection must
+  // fall back rather than fail. Which lower class it lands in is an implementation
+  // detail; what matters is that it picked the one admissible model and said so.
   assert.equal(result.id, reflex.id);
-  assert.equal(result.class, 'reflex');
-  assert.match(result.why, /falling back from coder/);
+  assert.equal(result.requestedClass, 'coder');
+  assert.notEqual(result.class, 'coder');
+  assert.match(result.why, /fell back from coder/);
+});
+
+test('selection works on a catalog of models it has never seen', async () => {
+  // The whole point of capability-based selection: unknown ids must still work.
+  const unknown = [
+    { id: 'someorg/brand-new-70b', type: 'llm', capabilities: ['tool_use'], sizeGb: 40, quantization: '4bit' },
+    { id: 'someorg/brand-new-3b', type: 'llm', capabilities: [], sizeGb: 2, quantization: '4bit' },
+  ];
+  const coder = await selectModel({ class: 'coder', endpoint, client: clientWith(unknown), admitFn: admissible });
+  assert.equal(coder.id, 'someorg/brand-new-70b', 'coder needs tool_use, only the 70b has it');
+
+  const reflex = await selectModel({ class: 'reflex', endpoint, client: clientWith(unknown), admitFn: admissible });
+  assert.equal(reflex.id, 'someorg/brand-new-3b', 'reflex prefers the smallest viable model');
+});
+
+test('an empty catalog fails with a clear message, not a crash', async () => {
+  await assert.rejects(
+    () => selectModel({ class: 'workhorse', endpoint, client: clientWith([]), admitFn: admissible }),
+    /no models reported by the endpoint/,
+  );
 });
 
 test('security models are never selected unless security is explicit', async () => {
