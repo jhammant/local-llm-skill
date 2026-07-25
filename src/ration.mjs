@@ -78,6 +78,68 @@ function executeSysctl(options = {}) {
   });
 }
 
+// NVIDIA hosts have dedicated VRAM rather than a unified-memory wired limit, so
+// the ceiling comes from the card, not from system RAM.
+function executeNvidiaSmi(options = {}) {
+  if (options.nvidiaSmiFn) return Promise.resolve(options.nvidiaSmiFn());
+  const execFileFn = options.execFileFn ?? execFile;
+  return new Promise((resolve) => {
+    execFileFn(
+      'nvidia-smi',
+      ['--query-gpu=memory.total', '--format=csv,noheader,nounits'],
+      { encoding: 'utf8', maxBuffer: 1024 * 1024 },
+      (error, stdout = '') => {
+        if (error) return resolve(null);
+        // sum across cards; values are MiB
+        const total = String(stdout)
+          .split('\n')
+          .map((l) => Number(l.trim()))
+          .filter((n) => Number.isFinite(n) && n > 0)
+          .reduce((a, b) => a + b, 0);
+        resolve(total > 0 ? total : null);
+      },
+    );
+  });
+}
+
+// The memory ceiling is platform-specific. Resolve it explicitly and report
+// which source won, so a user on an unsupported host can see why the number is
+// what it is rather than being silently given a guess.
+export async function resolveCeiling(options = {}, totalGb = 0) {
+  const env = options.env ?? process.env;
+  if (options.ceilingGb != null) {
+    return { ceilingGb: parseNonNegativeNumber(options.ceilingGb, 'ceilingGb'), source: 'option' };
+  }
+  if (env.LOCAL_LLM_CEILING_GB) {
+    return {
+      ceilingGb: parseNonNegativeNumber(env.LOCAL_LLM_CEILING_GB, 'LOCAL_LLM_CEILING_GB'),
+      source: 'LOCAL_LLM_CEILING_GB',
+    };
+  }
+  const { config } = paths(options);
+  const configured = await readJson(config, {}, 'local-llm config');
+  if (configured.ceilingGb != null) {
+    return { ceilingGb: parseNonNegativeNumber(configured.ceilingGb, 'config ceilingGb'), source: 'config' };
+  }
+
+  // explicit test hooks keep the macOS path addressable on any host
+  const platform = options.platform ?? process.platform;
+  if (options.wiredLimitMb != null || options.sysctlFn || platform === 'darwin') {
+    const mb = await executeSysctl(options);
+    // 0 means "unset" — macOS then allows roughly 75% of unified memory
+    return mb === 0
+      ? { ceilingGb: totalGb * 0.75, source: 'macOS default (75% of unified memory)' }
+      : { ceilingGb: mb / 1024, source: 'macOS iogpu.wired_limit_mb' };
+  }
+
+  if (platform === 'linux' || platform === 'win32') {
+    const mb = await executeNvidiaSmi(options);
+    if (mb != null) return { ceilingGb: mb / 1024, source: 'nvidia-smi total VRAM' };
+  }
+
+  return { ceilingGb: totalGb * 0.6, source: 'fallback estimate (60% of system RAM) — set ceilingGb to override' };
+}
+
 async function reserveGb(options = {}) {
   const env = options.env ?? process.env;
   if (env.LOCAL_LLM_RESERVE_GB != null && env.LOCAL_LLM_RESERVE_GB !== '') {
@@ -106,8 +168,7 @@ export async function budget(endpoint, options = {}) {
   const client = options.client ?? lmstudio;
   const totalBytes = options.totalMemBytes ?? (options.totalmemFn ?? totalmem)();
   const totalGb = totalBytes / BYTES_PER_GB;
-  const wiredLimitMb = await executeSysctl(options);
-  const ceilingGb = wiredLimitMb === 0 ? totalGb * 0.75 : wiredLimitMb / 1024;
+  const { ceilingGb, source: ceilingSource } = await resolveCeiling(options, totalGb);
   const reserve = await reserveGb(options);
   const budgetGb = ceilingGb - reserve;
   const loaded = options.loaded ?? await client.ps(endpoint);
@@ -119,6 +180,7 @@ export async function budget(endpoint, options = {}) {
   return {
     totalGb,
     ceilingGb,
+    ceilingSource,
     reserveGb: reserve,
     budgetGb,
     usedGb,
