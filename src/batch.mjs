@@ -226,6 +226,32 @@ function outputText(message) {
   return message;
 }
 
+// Constrained-output repair. Small quantized models routinely obey "reply with
+// one word" ~97% of the time and wrap the rest in punctuation, markdown, or a
+// sentence. Rather than discard those, canonicalise what is recoverable and
+// only fail the genuinely ambiguous ones.
+//
+// Three passes, narrowest first:
+//   1. the whole answer matches a permitted value
+//   2. the FIRST token matches (handles "bugfix." / "**bugfix**" / "bugfix\n...")
+//   3. exactly ONE permitted value appears anywhere (handles "The category is
+//      bugfix") — rejected if two or more appear, since that is a real ambiguity
+//      and guessing would silently corrupt the dataset.
+export function normalizeAnswer(raw, allowed) {
+  if (raw == null || !Array.isArray(allowed) || allowed.length === 0) return null;
+  const canonical = new Map(allowed.map((a) => [String(a).toLowerCase(), a]));
+  const strip = (s) => s.replace(/[`*_"'“”‘’.,:;!?()\[\]]/g, '').trim().toLowerCase();
+
+  const whole = strip(String(raw));
+  if (canonical.has(whole)) return canonical.get(whole);
+
+  const tokens = String(raw).split(/\s+/).map(strip).filter(Boolean);
+  if (tokens.length && canonical.has(tokens[0])) return canonical.get(tokens[0]);
+
+  const present = [...new Set(tokens.filter((t) => canonical.has(t)))];
+  return present.length === 1 ? canonical.get(present[0]) : null;
+}
+
 function tokenCount(usage) {
   const value = usage?.completion_tokens ?? usage?.output_tokens ?? usage?.total_tokens ?? 0;
   return Number.isFinite(Number(value)) ? Number(value) : 0;
@@ -271,6 +297,7 @@ export async function runBatch({
   sleep = wait,
   touchFn = touch,
   touchOptions = {},
+  allowed = null,
 } = {}) {
   requireEndpoint(endpoint);
   if (typeof model !== 'string' || model.length === 0) {
@@ -283,6 +310,10 @@ export async function runBatch({
   if (system != null && typeof system !== 'string') {
     throw new Error('Batch system prompt must be a string');
   }
+  if (allowed != null && (!Array.isArray(allowed) || allowed.length === 0)) {
+    throw new Error('Batch allowed values must be a non-empty array');
+  }
+  const allowedSet = allowed != null;
 
   const outputState = restart
     ? { records: [], repairBytes: null, needsLeadingNewline: false }
@@ -376,16 +407,49 @@ export async function runBatch({
   async function requestWithRetries(entry) {
     const requestStarted = Date.now();
     let lastError;
+    let lastRaw = null;
     for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt += 1) {
       try {
         const messages = [
           ...(system == null ? [] : [{ role: 'system', content: system }]),
           { role: 'user', content: entry.prompt },
         ];
+        // On a retry caused by an out-of-set answer, show the model what it said
+        // and restate the constraint. A bare re-ask tends to reproduce the same
+        // stray preamble; naming the mistake is what actually fixes it.
+        if (lastRaw != null && allowedSet) {
+          messages.push({ role: 'assistant', content: lastRaw });
+          messages.push({
+            role: 'user',
+            content:
+              `That is not one of the permitted answers. Reply with exactly one of: ` +
+              `${allowed.join(', ')}. Output only that word, nothing else.`,
+          });
+        }
         const result = await client.chat(endpoint, { model, messages });
+        const raw = outputText(result.message);
+
+        if (allowedSet) {
+          const canonical = normalizeAnswer(raw, allowed);
+          if (canonical == null) {
+            lastRaw = raw;
+            lastError = new Error(`response not in allowed set: ${JSON.stringify((raw ?? '').slice(0, 80))}`);
+            if (attempt < RETRY_DELAYS_MS.length) continue; // retry immediately; this is not a rate problem
+            break;
+          }
+          return {
+            ok: true,
+            response: canonical,
+            raw: raw === canonical ? undefined : raw,
+            usage: result.usage ?? null,
+            ms: result.ms ?? (Date.now() - requestStarted),
+            error: null,
+          };
+        }
+
         return {
           ok: true,
-          response: outputText(result.message),
+          response: raw,
           usage: result.usage ?? null,
           ms: result.ms ?? (Date.now() - requestStarted),
           error: null,
@@ -400,6 +464,7 @@ export async function runBatch({
     return {
       ok: false,
       response: null,
+      raw: lastRaw ?? undefined,
       usage: null,
       ms: Date.now() - requestStarted,
       error: lastError?.message ?? String(lastError),

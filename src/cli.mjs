@@ -32,6 +32,7 @@ const VALUE_OPTIONS = new Set([
   'field',
   'system',
   'concurrency',
+  'allow',
 ]);
 const BOOLEAN_OPTIONS = new Set([
   'json',
@@ -53,7 +54,7 @@ Usage:
   local-llm ask <prompt…> [--class c] [--model m] [--uncensored] [--json]
   local-llm batch <items.jsonl> (--template f | --prompt s) [--out f]
       [--class c] [--model m] [--field name] [--system f]
-      [--concurrency n] [--restart] [--dry-run] [--json]
+      [--concurrency n] [--allow a,b,c] [--restart] [--dry-run] [--json]
   local-llm load <model> [--dry-run] [--json]
   local-llm unload <identifier | --all> [--json]
   local-llm pin <model> | unpin <model> | pins [--json]
@@ -304,6 +305,9 @@ async function batchCommand(endpoint, options, inputFiles) {
       items,
       out,
       concurrency: options.concurrency,
+      allowed: options.allow
+        ? String(options.allow).split(',').map((v) => v.trim()).filter(Boolean)
+        : null,
       restart: options.restart,
       signal: controller.signal,
       onProgress: options.json
