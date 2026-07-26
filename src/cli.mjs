@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { readFile } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { getEndpoint, defaultEndpoint } from './endpoints.mjs';
 import * as lmstudio from './lmstudio.mjs';
@@ -544,8 +545,23 @@ export async function main(argv = process.argv.slice(2)) {
   }
 }
 
-const invokedDirectly = process.argv[1]
-  && import.meta.url === pathToFileURL(process.argv[1]).href;
+// Resolve argv[1] through any symlinks before comparing. Installed CLIs are
+// almost always reached via a link — `npm link`, a package manager shim, or a
+// hand-made symlink in ~/.local/bin — and in that case argv[1] is the LINK
+// path while import.meta.url is the REAL path. Comparing them unresolved makes
+// this check false, so main() never runs: the command exits 0 and prints
+// nothing, which looks like success everywhere it is tested.
+const invokedDirectly = (() => {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  let resolved = entry;
+  try {
+    resolved = realpathSync(entry);
+  } catch {
+    /* not a real path (e.g. a virtual entry) — fall back to the raw value */
+  }
+  return import.meta.url === pathToFileURL(resolved).href;
+})();
 if (invokedDirectly) {
   try {
     process.exitCode = await main();
