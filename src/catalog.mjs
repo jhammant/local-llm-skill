@@ -11,7 +11,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import * as lmstudio from './lmstudio.mjs';
+import { resolve } from './providers/index.mjs';
 import { admit } from './ration.mjs';
 
 const OVERRIDES = path.join(os.homedir(), '.config', 'local-llm', 'classes.json');
@@ -107,7 +107,7 @@ export async function selectModel({
   class: requestedClass = 'workhorse',
   endpoint,
   requireTools = false,
-  client = lmstudio,
+  client = null,
   admitFn = admit,
   admissionOptions = {},
   budgetGb = null,
@@ -121,9 +121,16 @@ export async function selectModel({
     );
   }
 
-  const models = await client.listModels(endpoint);
+  const provider = client ?? resolve(endpoint);
+  const models = await provider.listModels(endpoint);
   const overrides = readOverrides();
   const rejected = [];
+
+  // Backends that cannot report sizes (and catalogs where every size is
+  // unknown) get no size band and no admission filter — a missing size must
+  // never sort as zero, which would make an unknown model look smallest.
+  const sizesAvailable = provider.capabilities?.sizes !== false
+    && models.some((model) => Number.isFinite(model?.sizeGb));
 
   for (const candidateClass of FALLBACKS[requestedClass]) {
     const spec = JOB_CLASSES[candidateClass];
@@ -151,7 +158,10 @@ export async function selectModel({
         rejected.push(`${model.id}: no tool_use`);
         continue;
       }
-      const plan = await admitFn(endpoint, model.id, { ...admissionOptions, client, dryRun: true });
+      // Without size information there is no admission filter to apply.
+      const plan = sizesAvailable
+        ? await admitFn(endpoint, model.id, { ...admissionOptions, client: provider, dryRun: true })
+        : { ok: true, action: 'unmanaged', evicted: [], reason: 'backend does not report sizes' };
       if (!plan.ok) {
         rejected.push(`${model.id}: ${plan.reason}`);
         continue;
@@ -167,7 +177,8 @@ export async function selectModel({
           `${model.id} chosen for ${candidateClass}${via}: type=${model.type ?? '?'}` +
           `${model.quantization ? ', ' + model.quantization : ''}` +
           `${Number.isFinite(model.sizeGb) ? ', ' + model.sizeGb.toFixed(1) + 'GB' : ''}` +
-          `; admission ${plan.action}`,
+          `; admission ${plan.action}` +
+          `${sizesAvailable ? '' : '; selected without size information'}`,
       };
     }
   }

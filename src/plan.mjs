@@ -9,7 +9,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ITEM_LINE, normalizeAnswer, runBatch, substituteTemplate } from './batch.mjs';
-import * as lmstudio from './lmstudio.mjs';
+import { resolve } from './providers/index.mjs';
 
 export const SAMPLE_SIZE = 20;
 export const TIMING_SAMPLE_SIZE = 8;
@@ -207,8 +207,9 @@ export async function measureCompletionTokens({
   allowed = null,
   reasoningEffort,
   sampleSize = PROBE_SAMPLE_SIZE,
-  client = lmstudio,
+  client = null,
 } = {}) {
+  const provider = client ?? resolve(endpoint);
   const sample = sampleItems(items, sampleSize);
   if (sample.length === 0) return null;
   let total = 0;
@@ -218,7 +219,7 @@ export async function measureCompletionTokens({
       ...(system == null ? [] : [{ role: 'system', content: system }]),
       { role: 'user', content: prompt },
     ];
-    const result = await probeChat(client, endpoint, model, messages, allowed, reasoningEffort);
+    const result = await probeChat(provider, endpoint, model, messages, allowed, reasoningEffort);
     total += probeCompletionTokens(result.usage);
   }
   return {
@@ -256,10 +257,11 @@ export async function measureItemsPerSec({
   reasoningEffort,
   sampleSize = TIMING_SAMPLE_SIZE,
   concurrency = null,
-  client = lmstudio,
+  client = null,
   sleep,
   now = Date.now,
 } = {}) {
+  const provider = client ?? resolve(endpoint);
   const sample = sampleItems(items, sampleSize);
   if (sample.length === 0) return null;
   const directory = await mkdtemp(join(tmpdir(), 'local-llm-plan-sample-'));
@@ -276,7 +278,7 @@ export async function measureItemsPerSec({
       concurrency,
       reasoningEffort,
       allowed,
-      client,
+      client: provider,
       // A plan must not mutate ration/LRU state as a side effect of estimating.
       touchFn: async () => {},
       ...(sleep == null ? {} : { sleep }),
@@ -342,7 +344,7 @@ export async function planBatch({
   system,
   allowed = null,
   reasoningEffort,
-  client = lmstudio,
+  client = null,
   sleep,
   now,
   ...options
@@ -355,6 +357,7 @@ export async function planBatch({
   }
   if (!Array.isArray(items)) throw new Error('Plan items must be an array');
 
+  const provider = client ?? resolve(endpoint);
   const itemCount = items.length;
   const throughput = await readThroughput(options);
   const rate = rateForModel(throughput, endpoint.id, model);
@@ -388,7 +391,7 @@ export async function planBatch({
         reasoningEffort,
         sampleSize: timingSampleSize,
         concurrency,
-        client,
+        client: provider,
         ...(sleep == null ? {} : { sleep }),
         ...(now == null ? {} : { now }),
       });
@@ -420,7 +423,7 @@ export async function planBatch({
         allowed,
         reasoningEffort,
         sampleSize: probeSampleSize,
-        client,
+        client: provider,
       });
       completion = probed == null
         ? { value: ASSUMED_COMPLETION_TOKENS, source: 'assumed default' }

@@ -2,7 +2,30 @@ import { execFile } from 'node:child_process';
 import { readFile, mkdir, rename, writeFile } from 'node:fs/promises';
 import { homedir, totalmem } from 'node:os';
 import { dirname, join } from 'node:path';
-import * as lmstudio from './lmstudio.mjs';
+import { resolve } from './providers/index.mjs';
+
+// The client is normally the provider resolved from the endpoint; tests
+// inject fakes. A provider that cannot report sizes AND loaded state cannot
+// be memory-managed — budget() then reports managed:false and admit() steps
+// aside instead of inventing numbers.
+function providerFor(endpoint, client) {
+  return client ?? resolve(endpoint);
+}
+
+function isManaged(provider) {
+  const caps = provider?.capabilities ?? {};
+  return caps.sizes !== false && caps.loadedState !== false;
+}
+
+// pin/unpin on an unmanaged endpoint must fail clearly, not silently record
+// a pin that can never influence an eviction decision.
+function requireManaged(endpoint, options, operation) {
+  if (!isManaged(providerFor(endpoint, options.client))) {
+    throw new Error(
+      `Endpoint "${endpoint.id}" does not report model sizes or loaded state; ${operation} has no effect there`,
+    );
+  }
+}
 
 const BYTES_PER_GB = 1024 ** 3;
 const DEFAULT_RESERVE_GB = 12;
@@ -165,12 +188,29 @@ function requireEndpoint(endpoint) {
 
 export async function budget(endpoint, options = {}) {
   requireEndpoint(endpoint);
-  const client = options.client ?? lmstudio;
+  const client = providerFor(endpoint, options.client);
   const totalBytes = options.totalMemBytes ?? (options.totalmemFn ?? totalmem)();
   const totalGb = totalBytes / BYTES_PER_GB;
   const { ceilingGb, source: ceilingSource } = await resolveCeiling(options, totalGb);
   const reserve = await reserveGb(options);
   const budgetGb = ceilingGb - reserve;
+
+  // Unmanaged backends cannot report what is resident, so used/free are
+  // honestly null — never a guess. totalGb/ceilingGb still describe the host.
+  if (!isManaged(client)) {
+    return {
+      managed: false,
+      totalGb,
+      ceilingGb,
+      ceilingSource,
+      reserveGb: reserve,
+      budgetGb,
+      usedGb: null,
+      freeGb: null,
+      loaded: [],
+    };
+  }
+
   const loaded = options.loaded ?? await client.ps(endpoint);
   const usedGb = loaded.reduce((sum, model) => {
     const size = Number(model.sizeGb);
@@ -178,6 +218,7 @@ export async function budget(endpoint, options = {}) {
   }, 0);
 
   return {
+    managed: true,
     totalGb,
     ceilingGb,
     ceilingSource,
@@ -229,6 +270,7 @@ export async function pinModel(endpoint, modelId, options = {}) {
   if (typeof modelId !== 'string' || modelId.length === 0) {
     throw new Error('A model id is required');
   }
+  requireManaged(endpoint, options, 'pinning');
   if (options.dryRun) return listPins(endpoint, options);
   const { pins } = paths(options);
   return serializeStateWrite(async () => {
@@ -247,6 +289,7 @@ export async function unpinModel(endpoint, modelId, options = {}) {
   if (typeof modelId !== 'string' || modelId.length === 0) {
     throw new Error('A model id is required');
   }
+  requireManaged(endpoint, options, 'unpinning');
   if (options.dryRun) return listPins(endpoint, options);
   const { pins } = paths(options);
   return serializeStateWrite(async () => {
@@ -291,7 +334,7 @@ export async function admit(
   {
     pin = false,
     dryRun = false,
-    client = lmstudio,
+    client = null,
     ...options
   } = {},
 ) {
@@ -300,7 +343,21 @@ export async function admit(
     throw new Error('A model id is required for admission');
   }
 
-  const report = await budget(endpoint, { ...options, client });
+  const provider = providerFor(endpoint, client);
+
+  // Admission control is impossible without sizes and loaded state. Step
+  // aside — never throw, never block the run, never invent a number, and
+  // never pretend anything was evicted.
+  if (!isManaged(provider)) {
+    return {
+      ok: true,
+      action: 'unmanaged',
+      evicted: [],
+      reason: 'backend does not report sizes',
+    };
+  }
+
+  const report = await budget(endpoint, { ...options, client: provider });
   const alreadyLoaded = report.loaded.find((entry) => loadedMatches(entry, modelId));
   if (alreadyLoaded) {
     if (pin && !dryRun) await pinModel(endpoint, modelId, options);
@@ -310,7 +367,7 @@ export async function admit(
     });
   }
 
-  const models = options.models ?? await client.listModels(endpoint);
+  const models = options.models ?? await provider.listModels(endpoint);
   const model = models.find((candidate) => candidate.id === modelId);
   const modelSizeGb = Number(model?.sizeGb);
   if (!model || !Number.isFinite(modelSizeGb) || modelSizeGb <= 0) {
@@ -344,7 +401,7 @@ export async function admit(
   if (modelSizeGb <= report.freeGb) {
     const action = endpoint.control === 'jit' ? 'jit-load' : 'load';
     if (!dryRun && endpoint.control === 'cli') {
-      await client.load(endpoint, modelId, modelLoadOptions(model));
+      await provider.load(endpoint, modelId, modelLoadOptions(model));
     }
     if (pin && !dryRun) await pinModel(endpoint, modelId, options);
     return plannedResult({
@@ -397,13 +454,13 @@ export async function admit(
     const completedEvictions = [];
     try {
       for (const identifier of evicted) {
-        await client.unload(endpoint, identifier);
+        await provider.unload(endpoint, identifier);
         completedEvictions.push(identifier);
       }
     } finally {
       await forgetLru(endpoint, completedEvictions, options);
     }
-    await client.load(endpoint, modelId, modelLoadOptions(model));
+    await provider.load(endpoint, modelId, modelLoadOptions(model));
     if (pin) await pinModel(endpoint, modelId, options);
   }
 

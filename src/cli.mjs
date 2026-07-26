@@ -3,8 +3,9 @@
 import { readFile } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import { getEndpoint, defaultEndpoint } from './endpoints.mjs';
-import * as lmstudio from './lmstudio.mjs';
+import { getEndpoint, defaultEndpoint, listEndpoints } from './endpoints.mjs';
+import { resolve } from './providers/index.mjs';
+import { validateReasoningEffort } from './providers/http.mjs';
 import {
   admit,
   budget,
@@ -56,6 +57,7 @@ const BOOLEAN_OPTIONS = new Set([
 const HELP = `local-llm ${VERSION}
 
 Usage:
+  local-llm endpoints [--json]
   local-llm models [--fit] [--class <c>] [--json]
   local-llm ps [--json]
   local-llm budget [--json]
@@ -158,8 +160,50 @@ async function chooseEndpoint(id) {
   return id ? getEndpoint(id) : defaultEndpoint();
 }
 
+async function endpointsCommand(options) {
+  const endpoints = await listEndpoints();
+  const rows = await Promise.all(endpoints.map(async (endpoint) => {
+    const provider = resolve(endpoint);
+    let reachable = false;
+    try {
+      await Promise.race([
+        provider.listModels(endpoint),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('probe timed out')), 1_500)),
+      ]);
+      reachable = true;
+    } catch {
+      reachable = false;
+    }
+    return {
+      id: endpoint.id,
+      kind: provider.kind,
+      baseUrl: endpoint.baseUrl,
+      reachable,
+      capabilities: provider.capabilities,
+    };
+  }));
+
+  if (options.json) {
+    writeJson(rows);
+    return;
+  }
+  printRows(rows, [
+    { label: 'ID', value: (row) => row.id },
+    { label: 'KIND', value: (row) => row.kind },
+    { label: 'URL', value: (row) => row.baseUrl },
+    { label: 'REACHABLE', value: (row) => (row.reachable ? 'yes' : 'no') },
+    {
+      label: 'CAPABILITIES',
+      value: (row) => Object.entries(row.capabilities)
+        .filter(([, supported]) => supported)
+        .map(([name]) => name)
+        .join(' '),
+    },
+  ]);
+}
+
 async function modelsCommand(endpoint, options) {
-  let models = await lmstudio.listModels(endpoint);
+  let models = await resolve(endpoint).listModels(endpoint);
   if (options.class) {
     const preferred = JOB_CLASSES[options.class];
     if (!preferred) {
@@ -186,6 +230,7 @@ async function modelsCommand(endpoint, options) {
     writeJson(models);
     return;
   }
+  process.stdout.write(`Endpoint: ${endpoint.id} (${endpoint.baseUrl})\n`);
   printRows(models, [
     { label: 'MODEL', value: (row) => row.id },
     { label: 'TYPE', value: (row) => row.type },
@@ -205,15 +250,18 @@ async function psCommand(endpoint, options) {
     writeJson(result);
     return;
   }
+  process.stdout.write(`Endpoint: ${endpoint.id} (${endpoint.baseUrl})\n`);
   printRows(report.loaded, [
     { label: 'IDENTIFIER', value: (row) => row.identifier },
     { label: 'MODEL', value: (row) => row.model },
-    { label: 'SIZE', value: (row) => roundGb(row.sizeGb) },
+    { label: 'SIZE', value: (row) => (row.sizeGb == null ? '?' : roundGb(row.sizeGb)) },
     { label: 'CONTEXT', value: (row) => row.context },
     { label: 'PARALLEL', value: (row) => row.parallel },
   ]);
   process.stdout.write(
-    `Memory: ${roundGb(report.usedGb)} used / ${roundGb(report.budgetGb)} budget (${roundGb(report.freeGb)} free)\n`,
+    report.managed === false
+      ? 'memory: unmanaged (this backend does not report model sizes)\n'
+      : `Memory: ${roundGb(report.usedGb)} used / ${roundGb(report.budgetGb)} budget (${roundGb(report.freeGb)} free)\n`,
   );
 }
 
@@ -223,14 +271,19 @@ async function budgetCommand(endpoint, options) {
     writeJson(report);
     return;
   }
+  process.stdout.write(`Endpoint: ${endpoint.id} (${endpoint.baseUrl})\n`);
   process.stdout.write(
     [
       `Total unified memory: ${roundGb(report.totalGb)}`,
       `GPU wired ceiling:   ${roundGb(report.ceilingGb)}`,
       `OS/app reserve:      ${roundGb(report.reserveGb)}`,
       `Inference budget:    ${roundGb(report.budgetGb)}`,
-      `Loaded models:       ${roundGb(report.usedGb)}`,
-      `Free budget:         ${roundGb(report.freeGb)}`,
+      ...(report.managed === false
+        ? ['memory: unmanaged (this backend does not report model sizes)']
+        : [
+          `Loaded models:       ${roundGb(report.usedGb)}`,
+          `Free budget:         ${roundGb(report.freeGb)}`,
+        ]),
     ].join('\n') + '\n',
   );
 }
@@ -461,10 +514,11 @@ async function unloadCommand(endpoint, options, args) {
   if (!options.all && args.length !== 1) {
     throw new Error('unload requires an identifier or --all');
   }
+  const provider = resolve(endpoint);
   const identifiers = options.all
-    ? (await lmstudio.ps(endpoint)).map((entry) => entry.identifier)
+    ? (await provider.ps(endpoint)).map((entry) => entry.identifier)
     : args;
-  for (const identifier of identifiers) await lmstudio.unload(endpoint, identifier);
+  for (const identifier of identifiers) await provider.unload(endpoint, identifier);
   const result = { unloaded: identifiers };
   if (options.json) writeJson(result);
   else process.stdout.write(
@@ -490,7 +544,7 @@ async function pinsCommand(endpoint, options, command, args) {
 export async function main(argv = process.argv.slice(2)) {
   const { options, positionals } = parseArgs(argv);
   if (options.reasoningEffort != null) {
-    options.reasoningEffort = lmstudio.validateReasoningEffort(options.reasoningEffort);
+    options.reasoningEffort = validateReasoningEffort(options.reasoningEffort);
   }
   if (options.version) {
     if (options.json) writeJson({ version: VERSION });
@@ -503,6 +557,13 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   const [command, ...args] = positionals;
+  // `endpoints` reports on the whole registry, so it must not require a
+  // resolvable default endpoint first.
+  if (command === 'endpoints') {
+    if (args.length > 0) throw new Error('endpoints takes no positional arguments');
+    await endpointsCommand(options);
+    return 0;
+  }
   const endpoint = await chooseEndpoint(options.endpoint);
   switch (command) {
     case 'models':
