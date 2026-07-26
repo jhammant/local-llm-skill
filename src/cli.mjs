@@ -405,7 +405,7 @@ async function planCommand(endpoint, options, args) {
       `  completion/item:     ${plan.completionTokensPerItem.value} (${plan.completionTokensPerItem.source})`,
       `  aggregate rate:      ${plan.rate.tokPerSec.toFixed(1)} tok/s (${plan.rate.source})`,
       `  total tokens:        ~${Math.round(plan.totalTokens).toLocaleString('en-US')}`,
-      `  ETA:                 ${formatSeconds(plan.etaSeconds)}`,
+      `  ETA:                 ${formatSeconds(plan.etaSeconds)} (${plan.etaMethod})`,
     ].join('\n') + '\n',
   );
 }
@@ -436,6 +436,9 @@ async function benchCommand(endpoint, options) {
       `  model load:          ${result.loadSeconds.toFixed(1)} s`,
       `  single stream:       ${result.singleTokPerSec.toFixed(1)} tok/s (mean of ${result.runs} run(s) at ${result.maxTokens} max tokens)`,
       `  ${result.concurrency}-way aggregate:  ${result.aggregateTokPerSec.toFixed(1)} tok/s (measured)`,
+      `  prefill (prompt):    ${result.promptTokPerSec.toFixed(1)} tok/s`,
+      `  decode (completion): ${result.completionTokPerSec.toFixed(1)} tok/s`,
+      `  end-to-end:          ${result.itemsPerSec.toFixed(2)} items/s at ${result.concurrency}-way concurrency`,
       ...(result.warning ? [`  WARNING: ${result.warning}`] : []),
       `  recorded to ${cachePath}`,
     ].join('\n') + '\n',

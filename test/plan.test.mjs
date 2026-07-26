@@ -125,9 +125,93 @@ test('planBatch uses a measured rate from the throughput cache', async (t) => {
   assert.equal(plan.rate.measured, true);
   assert.equal(plan.rate.tokPerSec, 86.8);
   assert.match(plan.rate.source, /measured/);
+  // No itemsPerSec or prefill/decode rates recorded -> single-rate fallback.
+  assert.match(plan.etaMethod, /single aggregate rate \(least accurate/);
   // 1 prompt token + 300 assumed completion tokens per item, 40 items.
   const expected = (40 * (1 + 300)) / 86.8;
   assert.ok(Math.abs(plan.etaSeconds - expected) < 1e-6);
+});
+
+test('regression: measured items/s puts 3803 short-output items at ~2030s, not ~6289s', async (t) => {
+  // Ground truth from laguna-s-2.1 (reasoning_effort=none): 3803 items of
+  // 154 prompt + 2.7 completion tokens each ran at 1.87 items/s (~34 min).
+  // The single-rate model bills all 156.7 tokens/item at the 94.9 tok/s decode
+  // rate and predicts ~6289s — 3x over. plan must prefer the measured items/s.
+  const directory = await mkdtemp(join(tmpdir(), 'local-llm-plan-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const throughputPath = join(directory, 'throughput.json');
+  await writeFile(throughputPath, JSON.stringify({
+    'local/laguna-s-2.1': {
+      endpoint: 'local',
+      model: 'laguna-s-2.1',
+      singleTokPerSec: 94.9,
+      aggregateTokPerSec: 94.9,
+      promptTokPerSec: 2000,
+      completionTokPerSec: 94.9,
+      itemsPerSec: 1.87,
+      concurrency: 4,
+      measuredAt: '2026-07-25T00:00:00.000Z',
+    },
+  }));
+
+  // 616 chars / 4 chars-per-token = exactly 154 prompt tokens per item.
+  const plan = await planBatch({
+    endpoint,
+    model: 'laguna-s-2.1',
+    template: 'x'.repeat(616),
+    items: Array.from({ length: 3803 }, () => ({ text: 'ignored' })),
+    throughputPath,
+    probe: false,
+    completionTokensPerItem: 2.7,
+  });
+
+  assert.equal(plan.sample.promptTokensPerItem, 154);
+  assert.match(plan.etaMethod, /measured items\/s/);
+  const GROUND_TRUTH_SECONDS = 2030; // 3803 items / 1.87 items/s = ~2034s
+  assert.ok(
+    Math.abs(plan.etaSeconds - GROUND_TRUTH_SECONDS) / GROUND_TRUTH_SECONDS <= 0.25,
+    `ETA ${plan.etaSeconds}s must be within 25% of the ${GROUND_TRUTH_SECONDS}s ground truth`,
+  );
+  const singleRateEta = (3803 * (154 + 2.7)) / 94.9;
+  assert.ok(singleRateEta > 6000, 'the single-rate model must reproduce the original ~6289s bug');
+  assert.ok(
+    Math.abs(plan.etaSeconds - singleRateEta) / singleRateEta > 0.25,
+    `ETA ${plan.etaSeconds}s must not be the single-rate figure ${singleRateEta}s`,
+  );
+});
+
+test('planBatch combines separate prefill/decode rates when no items/s is recorded', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'local-llm-plan-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const throughputPath = join(directory, 'throughput.json');
+  await writeFile(throughputPath, JSON.stringify({
+    'local/laguna-s-2.1': {
+      endpoint: 'local',
+      model: 'laguna-s-2.1',
+      aggregateTokPerSec: 94.9,
+      promptTokPerSec: 2000,
+      completionTokPerSec: 94.9,
+      concurrency: 4,
+      measuredAt: '2026-07-25T00:00:00.000Z',
+    },
+  }));
+
+  const plan = await planBatch({
+    endpoint,
+    model: 'laguna-s-2.1',
+    template: 'x'.repeat(616),
+    items: Array.from({ length: 3803 }, () => ({ text: 'ignored' })),
+    throughputPath,
+    probe: false,
+    completionTokensPerItem: 2.7,
+  });
+
+  assert.match(plan.etaMethod, /separate prefill\/decode rates/);
+  // (154/2000 + 2.7/94.9) seconds/item x 3803 items / 4 slots.
+  const expected = ((154 / 2000 + 2.7 / 94.9) * 3803) / 4;
+  assert.ok(Math.abs(plan.etaSeconds - expected) < 1e-6);
+  // Far closer to the ~2030s ground truth than the ~6289s single-rate figure.
+  assert.ok(Math.abs(plan.etaSeconds - 2030) < Math.abs(plan.etaSeconds - 6289));
 });
 
 test('planBatch ignores a bench record flagged unreliable', async (t) => {

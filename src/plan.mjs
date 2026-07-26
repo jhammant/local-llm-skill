@@ -114,15 +114,24 @@ export function samplePromptTokens(items, template, sampleSize = SAMPLE_SIZE) {
 // from the throughput cache when present, else a clearly labelled assumption.
 // A record bench flagged unreliable (e.g. an impossible aggregate-below-
 // single-stream sample) is ignored — a noisy measurement is worse than none.
+//
+// Prompt and completion tokens have completely different throughput (prefill
+// is compute-bound, decode memory-bandwidth-bound, often 10-30x slower per
+// token), so the separate rates and the end-to-end itemsPerSec bench records
+// are surfaced alongside the legacy aggregate; planBatch picks between them.
 export function rateForModel(throughput, endpointId, model) {
   const entry = throughput?.[throughputKey(endpointId, model)];
   const usable = entry
     && entry.warning == null
     && Number.isFinite(Number(entry.aggregateTokPerSec))
     && Number(entry.aggregateTokPerSec) > 0;
+  const positive = (value) => (Number.isFinite(Number(value)) && Number(value) > 0 ? Number(value) : null);
   if (usable) {
     return {
       tokPerSec: Number(entry.aggregateTokPerSec),
+      promptTokPerSec: positive(entry.promptTokPerSec),
+      completionTokPerSec: positive(entry.completionTokPerSec),
+      itemsPerSec: positive(entry.itemsPerSec),
       concurrency: Number.isFinite(Number(entry.concurrency)) ? Number(entry.concurrency) : null,
       source: `measured (bench ${entry.measuredAt ?? 'earlier'})`,
       measured: true,
@@ -133,6 +142,9 @@ export function rateForModel(throughput, endpointId, model) {
     : `run "local-llm bench --model ${model}" to measure`;
   return {
     tokPerSec: ASSUMED_TOK_PER_SEC,
+    promptTokPerSec: null,
+    completionTokPerSec: null,
+    itemsPerSec: null,
     concurrency: null,
     source: `assumed default (${ASSUMED_TOK_PER_SEC} tok/s aggregate) — ${reason}`,
     measured: false,
@@ -277,7 +289,31 @@ export async function planBatch({
   const itemCount = items.length;
   const tokensPerItem = prompt.promptTokensPerItem + completion.value;
   const totalTokens = tokensPerItem * itemCount;
-  const etaSeconds = rate.tokPerSec > 0 ? totalTokens / rate.tokPerSec : null;
+
+  // ETA, in order of preference:
+  // (a) bench's measured end-to-end items/s — the most reliable predictor, and
+  //     it already includes concurrency, so never divide by the slot count;
+  // (b) separate prefill/decode rates — prefill is compute-bound and fast,
+  //     decode memory-bandwidth-bound and slow, so seconds/item is
+  //     promptTokens/promptTokPerSec + completionTokens/completionTokPerSec,
+  //     scaled down by the model's parallel slots;
+  // (c) the legacy single aggregate rate — least accurate, because it bills
+  //     prompt tokens at the decode rate (this over-estimated a real
+  //     3,803-item job by 3x: 1h44m predicted vs ~34m actual).
+  let etaSeconds = null;
+  let etaMethod;
+  if (rate.itemsPerSec != null) {
+    etaSeconds = itemCount / rate.itemsPerSec;
+    etaMethod = 'measured items/s (most reliable)';
+  } else if (rate.promptTokPerSec != null && rate.completionTokPerSec != null) {
+    const secondsPerItem = prompt.promptTokensPerItem / rate.promptTokPerSec
+      + completion.value / rate.completionTokPerSec;
+    etaSeconds = (secondsPerItem * itemCount) / (rate.concurrency ?? 1);
+    etaMethod = 'separate prefill/decode rates';
+  } else {
+    etaSeconds = rate.tokPerSec > 0 ? totalTokens / rate.tokPerSec : null;
+    etaMethod = 'single aggregate rate (least accurate — prompt tokens billed at the decode rate)';
+  }
 
   return {
     endpoint: endpoint.id,
@@ -289,5 +325,6 @@ export async function planBatch({
     tokensPerItem,
     totalTokens,
     etaSeconds,
+    etaMethod,
   };
 }

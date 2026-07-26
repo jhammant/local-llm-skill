@@ -24,12 +24,25 @@ import { throughputKey, throughputPath } from './plan.mjs';
 
 const BENCH_PROMPT = 'Write a detailed essay of at least 300 words explaining how a hash map resolves collisions, covering both chaining and open addressing with worked examples.';
 const BENCH_MAX_TOKENS = 256;
+// Prefill probe: a deliberately long prompt with a tiny token budget, so the
+// wall time is almost entirely prompt processing. Prompt and completion rates
+// differ wildly (prefill is compute-bound, decode memory-bandwidth-bound, often
+// 10-30x slower per token), so they are measured and recorded separately —
+// billing prompt tokens at the decode rate made plan over-estimate a real
+// 3,803-item job by 3x.
+const PREFILL_PROMPT = `${BENCH_PROMPT} `.repeat(40).trim();
+const PREFILL_MAX_TOKENS = 8;
 const DEFAULT_RUNS = 3;
 const DEFAULT_CONCURRENCY = 4;
 export const UNRELIABLE_WARNING = 'unreliable (aggregate below single-stream)';
 
 function completionTokens(usage) {
   const value = usage?.completion_tokens ?? usage?.output_tokens ?? 0;
+  return Number.isFinite(Number(value)) ? Number(value) : 0;
+}
+
+function promptTokens(usage) {
+  const value = usage?.prompt_tokens ?? usage?.input_tokens ?? 0;
   return Number.isFinite(Number(value)) ? Number(value) : 0;
 }
 
@@ -98,6 +111,18 @@ export async function runBench({
     throw new Error(`Bench concurrency must be a positive integer; received "${slots}"`);
   }
 
+  // Prefill rate: long prompt, tiny generation budget — the wall clock is
+  // dominated by prompt processing, so prompt_tokens / seconds is the prefill
+  // rate. Single-stream, like the decode figure below.
+  const prefillStarted = nowFn();
+  const prefill = await client.chat(endpoint, {
+    model,
+    messages: [{ role: 'user', content: PREFILL_PROMPT }],
+    maxTokens: PREFILL_MAX_TOKENS,
+  });
+  const prefillSeconds = Math.max(0.001, (nowFn() - prefillStarted) / 1_000);
+  const promptTokPerSec = promptTokens(prefill.usage) / prefillSeconds;
+
   const measure = async (tokenBudget) => {
     // Single stream, averaged over `runs` runs to damp sample noise.
     let singleTokPerSec = 0;
@@ -109,24 +134,30 @@ export async function runBench({
     }
     singleTokPerSec /= runs;
 
-    // Concurrent aggregate across the model's advertised PARALLEL slots.
+    // Concurrent aggregate across the model's advertised PARALLEL slots. This
+    // is also `slots` realistic end-to-end requests, so itemsPerSec — the most
+    // reliable ETA predictor — comes straight from the same wall clock.
     const concurrentStarted = nowFn();
     const results = await Promise.all(
       Array.from({ length: slots }, () => client.chat(endpoint, { model, messages, maxTokens: tokenBudget })),
     );
     const concurrentSeconds = Math.max(0.001, (nowFn() - concurrentStarted) / 1_000);
     const concurrentTokens = results.reduce((sum, result) => sum + completionTokens(result.usage), 0);
-    return { singleTokPerSec, aggregateTokPerSec: concurrentTokens / concurrentSeconds };
+    return {
+      singleTokPerSec,
+      aggregateTokPerSec: concurrentTokens / concurrentSeconds,
+      itemsPerSec: slots / concurrentSeconds,
+    };
   };
 
   let tokenBudget = maxTokens;
-  let { singleTokPerSec, aggregateTokPerSec } = await measure(tokenBudget);
+  let { singleTokPerSec, aggregateTokPerSec, itemsPerSec } = await measure(tokenBudget);
   let warning = null;
   if (aggregateTokPerSec < singleTokPerSec) {
     // Impossible for a batching server — the sample was too noisy. Retry once
     // with double the token budget so generation dominates the fixed costs.
     tokenBudget = maxTokens * 2;
-    ({ singleTokPerSec, aggregateTokPerSec } = await measure(tokenBudget));
+    ({ singleTokPerSec, aggregateTokPerSec, itemsPerSec } = await measure(tokenBudget));
     if (aggregateTokPerSec < singleTokPerSec) warning = UNRELIABLE_WARNING;
   }
 
@@ -135,6 +166,9 @@ export async function runBench({
     model,
     singleTokPerSec,
     aggregateTokPerSec,
+    promptTokPerSec,
+    completionTokPerSec: singleTokPerSec,
+    itemsPerSec,
     concurrency: slots,
     loadSeconds,
     prompt,

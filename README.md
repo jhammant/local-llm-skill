@@ -139,16 +139,22 @@ Every figure is labelled by its basis — measured or assumed:
 local-llm plan reviews.jsonl --template classify.txt --class workhorse
 ```
 
-The ETA uses the measured aggregate tok/s for the model from
-`~/.local/state/local-llm/throughput.json` when present, and a clearly
-labelled default otherwise. Note that the end-to-end item rate
-(`itemsCompleted / wallClockSeconds`) already includes the effect of
+The ETA prefers, in order: a measured end-to-end items/s for the model, then
+separate prefill/decode rates (seconds/item = prompt tokens ÷ prefill rate +
+completion tokens ÷ decode rate, divided by concurrency), then the measured
+aggregate tok/s from `~/.local/state/local-llm/throughput.json`, and finally a
+clearly labelled default. The method used is stated in the output. Prompt and
+completion tokens have very different throughput — prefill is compute-bound
+and fast, decode memory-bandwidth-bound and slow — so billing both at one
+rate over-estimates prompt-heavy jobs badly. Note that the end-to-end item
+rate (`itemsCompleted / wallClockSeconds`) already includes the effect of
 concurrency; an ETA must never divide by the slot count again.
 
 `local-llm bench` produces those measured rates. It times the model load,
-measures single-stream tok/s, then measures the concurrent aggregate tok/s
-across the model's advertised `PARALLEL` slots, and records all three in the
-throughput cache:
+measures single-stream tok/s, measures the concurrent aggregate tok/s
+across the model's advertised `PARALLEL` slots, times prefill separately with
+a long prompt and tiny generation budget, and records all of them plus an
+end-to-end items/s figure in the throughput cache:
 
 ```sh
 local-llm bench --model qwen3-coder-next
