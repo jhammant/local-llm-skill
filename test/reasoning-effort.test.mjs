@@ -121,7 +121,7 @@ test('batch forwards the reasoning effort to the client on every item', async (t
   assert.ok(calls.every((request) => request.reasoningEffort === undefined));
 });
 
-test('plan probe inherits the reasoning effort flag', async (t) => {
+test('plan inherits the reasoning effort flag on both the sample and the probe', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'local-llm-effort-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
 
@@ -142,9 +142,17 @@ test('plan probe inherits the reasoning effort flag', async (t) => {
   };
 
   await planBatch({ ...base, reasoningEffort: 'none' });
-  assert.equal(calls.length, 3, 'default probe samples 3 items');
+  assert.equal(calls.length, 8, 'default sample runs 8 items end-to-end');
   assert.ok(
     calls.every((request) => request.reasoningEffort === 'none'),
+    'every sample request must carry the effort the real run will use',
+  );
+
+  calls.length = 0;
+  await planBatch({ ...base, sample: false, reasoningEffort: 'high' });
+  assert.equal(calls.length, 3, 'the fallback probe samples 3 items');
+  assert.ok(
+    calls.every((request) => request.reasoningEffort === 'high'),
     'every probe request must carry the effort the real run will use',
   );
 

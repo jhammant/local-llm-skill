@@ -91,6 +91,7 @@ test('planBatch labels an unmeasured rate as assumed', async (t) => {
     template: 'Say: {{text}}',
     items: Array.from({ length: 40 }, () => ({ text: 'some input text' })),
     throughputPath: join(directory, 'throughput.json'),
+    sample: false,
     probe: false,
   });
   assert.equal(plan.items, 40);
@@ -120,6 +121,7 @@ test('planBatch uses a measured rate from the throughput cache', async (t) => {
     template: '{{text}}',
     items,
     throughputPath,
+    sample: false,
     probe: false,
   });
   assert.equal(plan.rate.measured, true);
@@ -132,11 +134,16 @@ test('planBatch uses a measured rate from the throughput cache', async (t) => {
   assert.ok(Math.abs(plan.etaSeconds - expected) < 1e-6);
 });
 
-test('regression: measured items/s puts 3803 short-output items at ~2030s, not ~6289s', async (t) => {
+test('regression: a timed end-to-end sample puts 3803 short-output items at ~2030s', async (t) => {
   // Ground truth from laguna-s-2.1 (reasoning_effort=none): 3803 items of
   // 154 prompt + 2.7 completion tokens each ran at 1.87 items/s (~34 min).
-  // The single-rate model bills all 156.7 tokens/item at the 94.9 tok/s decode
-  // rate and predicts ~6289s — 3x over. plan must prefer the measured items/s.
+  // Every token-rate model failed against this: single aggregate predicted
+  // ~6289s (3x over), bench's items/s — measured on bench's own long-
+  // generation prompt — predicted ~10865s (5x over), and separate
+  // prefill/decode rates predicted ~7m (5x under, because short requests are
+  // dominated by fixed per-request overhead). plan must time a real sample of
+  // the actual job instead. The bench record below deliberately carries the
+  // misleading 0.35 items/s to prove plan never consults it.
   const directory = await mkdtemp(join(tmpdir(), 'local-llm-plan-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const throughputPath = join(directory, 'throughput.json');
@@ -148,11 +155,83 @@ test('regression: measured items/s puts 3803 short-output items at ~2030s, not ~
       aggregateTokPerSec: 94.9,
       promptTokPerSec: 2000,
       completionTokPerSec: 94.9,
-      itemsPerSec: 1.87,
+      itemsPerSec: 0.35,
       concurrency: 4,
       measuredAt: '2026-07-25T00:00:00.000Z',
     },
   }));
+
+  // Fake client + fake clock: each of the 8 sample items advances the clock
+  // 0.535s, so the sample takes 4.28s wall clock = 1.87 items/s.
+  let clock = 1_000_000;
+  let calls = 0;
+  const seen = [];
+  const fakeClient = {
+    async chat(_endpoint, { messages, reasoningEffort }) {
+      calls += 1;
+      seen.push({ messages, reasoningEffort });
+      clock += 535;
+      return {
+        message: { content: 'bugfix' },
+        usage: { prompt_tokens: 154, completion_tokens: 2.7 },
+      };
+    },
+  };
+
+  const plan = await planBatch({
+    endpoint,
+    model: 'laguna-s-2.1',
+    template: 'Classify: {{text}}',
+    items: Array.from({ length: 3803 }, () => ({ text: 'some review text' })),
+    throughputPath,
+    allowed: ['bugfix', 'feature'],
+    reasoningEffort: 'none',
+    client: fakeClient,
+    now: () => clock,
+  });
+
+  assert.equal(calls, 8, 'the default sample runs 8 real items end-to-end');
+  assert.ok(
+    seen.every(({ reasoningEffort }) => reasoningEffort === 'none'),
+    'the sample must run with the same reasoning effort as the real batch',
+  );
+  assert.match(plan.etaMethod, /measured \(end-to-end sample of 8 items\)/);
+  assert.ok(Math.abs(plan.itemsPerSec.value - 8 / 4.28) < 1e-9);
+  const GROUND_TRUTH_SECONDS = 2030; // 3803 items at 1.87 items/s
+  assert.ok(
+    Math.abs(plan.etaSeconds - GROUND_TRUTH_SECONDS) / GROUND_TRUTH_SECONDS <= 0.25,
+    `ETA ${plan.etaSeconds}s must be within 25% of the ${GROUND_TRUTH_SECONDS}s ground truth`,
+  );
+  // The same sample replaces the chars/4 heuristic and the 300-token
+  // assumption with API-reported usage.
+  assert.equal(plan.sample.promptTokensPerItem, 154);
+  assert.match(plan.sample.source, /measured \(end-to-end sample of 8 items\)/);
+  assert.equal(plan.completionTokensPerItem.value, 2.7);
+  assert.match(plan.completionTokensPerItem.source, /measured \(end-to-end sample of 8 items\)/);
+});
+
+test('--no-sample keeps the token-rate estimate, labelled least accurate', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'local-llm-plan-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const throughputPath = join(directory, 'throughput.json');
+  await writeFile(throughputPath, JSON.stringify({
+    'local/laguna-s-2.1': {
+      endpoint: 'local',
+      model: 'laguna-s-2.1',
+      aggregateTokPerSec: 94.9,
+      itemsPerSec: 0.35,
+      concurrency: 4,
+      measuredAt: '2026-07-25T00:00:00.000Z',
+    },
+  }));
+
+  let calls = 0;
+  const fakeClient = {
+    async chat() {
+      calls += 1;
+      return { message: { content: 'bugfix' }, usage: { completion_tokens: 3 } };
+    },
+  };
 
   // 616 chars / 4 chars-per-token = exactly 154 prompt tokens per item.
   const plan = await planBatch({
@@ -161,26 +240,47 @@ test('regression: measured items/s puts 3803 short-output items at ~2030s, not ~
     template: 'x'.repeat(616),
     items: Array.from({ length: 3803 }, () => ({ text: 'ignored' })),
     throughputPath,
+    sample: false,
     probe: false,
     completionTokensPerItem: 2.7,
+    client: fakeClient,
   });
 
-  assert.equal(plan.sample.promptTokensPerItem, 154);
-  assert.match(plan.etaMethod, /measured items\/s/);
-  const GROUND_TRUTH_SECONDS = 2030; // 3803 items / 1.87 items/s = ~2034s
-  assert.ok(
-    Math.abs(plan.etaSeconds - GROUND_TRUTH_SECONDS) / GROUND_TRUTH_SECONDS <= 0.25,
-    `ETA ${plan.etaSeconds}s must be within 25% of the ${GROUND_TRUTH_SECONDS}s ground truth`,
-  );
-  const singleRateEta = (3803 * (154 + 2.7)) / 94.9;
-  assert.ok(singleRateEta > 6000, 'the single-rate model must reproduce the original ~6289s bug');
-  assert.ok(
-    Math.abs(plan.etaSeconds - singleRateEta) / singleRateEta > 0.25,
-    `ETA ${plan.etaSeconds}s must not be the single-rate figure ${singleRateEta}s`,
-  );
+  assert.equal(calls, 0, '--no-sample must not touch the model');
+  assert.equal(plan.itemsPerSec, null);
+  assert.match(plan.etaMethod, /least accurate/);
+  // bench's misleading 0.35 items/s (=> ~10865s) must not be consulted; the
+  // fallback is the single aggregate rate over 154 + 2.7 tokens per item.
+  const expected = (3803 * (154 + 2.7)) / 94.9;
+  assert.ok(Math.abs(plan.etaSeconds - expected) < 1e-6);
 });
 
-test('planBatch combines separate prefill/decode rates when no items/s is recorded', async (t) => {
+test('a failing end-to-end sample falls back instead of crashing', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'local-llm-plan-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+
+  const failingClient = {
+    async chat() {
+      throw new Error('model not loaded');
+    },
+  };
+  const plan = await planBatch({
+    endpoint,
+    model: 'never-benched-model',
+    template: '{{text}}',
+    items: Array.from({ length: 40 }, () => ({ text: 'aaaa' })),
+    throughputPath: join(directory, 'throughput.json'),
+    client: failingClient,
+    sleep: async () => {},
+    probe: false,
+  });
+
+  assert.ok(plan.etaSeconds > 0);
+  assert.match(plan.etaMethod, /least accurate/);
+  assert.match(plan.etaMethod, /end-to-end sample failed: 8 of 8 sampled item\(s\) failed/);
+});
+
+test('planBatch combines separate prefill/decode rates when sampling is disabled', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'local-llm-plan-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const throughputPath = join(directory, 'throughput.json');
@@ -202,6 +302,7 @@ test('planBatch combines separate prefill/decode rates when no items/s is record
     template: 'x'.repeat(616),
     items: Array.from({ length: 3803 }, () => ({ text: 'ignored' })),
     throughputPath,
+    sample: false,
     probe: false,
     completionTokensPerItem: 2.7,
   });
@@ -238,6 +339,7 @@ test('planBatch ignores a bench record flagged unreliable', async (t) => {
     template: '{{text}}',
     items: Array.from({ length: 40 }, () => ({ text: 'aaaa' })),
     throughputPath,
+    sample: false,
     probe: false,
   });
 
@@ -269,6 +371,7 @@ test('planBatch probes the model: a 3-token completion shrinks the estimate ~100
     template: '{{text}}',
     items,
     throughputPath,
+    sample: false,
   };
 
   const measuredPlan = await planBatch({ ...base, client: fakeClient });
@@ -309,6 +412,7 @@ test('planBatch probe honours --allow via the constrained-output path', async (t
     items: Array.from({ length: 40 }, () => ({ text: 'aaaa' })),
     throughputPath: join(directory, 'throughput.json'),
     allowed: ['yes', 'no'],
+    sample: false,
     client: fakeClient,
   });
 
@@ -336,6 +440,7 @@ test('planBatch falls back to the assumed default when the probe fails', async (
     template: '{{text}}',
     items: Array.from({ length: 40 }, () => ({ text: 'aaaa' })),
     throughputPath: join(directory, 'throughput.json'),
+    sample: false,
     client: failingClient,
   });
 

@@ -132,23 +132,33 @@ failures rather than silently guessed.
 ## Estimating and benchmarking
 
 `local-llm plan` estimates a batch before you run it: item count, tokens per
-item (from sampling ~20 items through the template), total tokens, and an ETA.
-Every figure is labelled by its basis — measured or assumed:
+item, total tokens, and an ETA. By default it times a real end-to-end sample
+of the actual job — 8 items (`--sample N` to change) rendered through the
+template and run through the same code path as the batch, with the same
+concurrency, `--allow` constrained-output retries, and reasoning effort —
+because short requests are dominated by fixed per-request overhead that no
+token-rate model captures. The same sample also measures prompt and completion
+tokens per item from the API's reported usage. Every figure is labelled by its
+basis — measured or assumed:
 
 ```sh
 local-llm plan reviews.jsonl --template classify.txt --class workhorse
 ```
 
-The ETA prefers, in order: a measured end-to-end items/s for the model, then
-separate prefill/decode rates (seconds/item = prompt tokens ÷ prefill rate +
-completion tokens ÷ decode rate, divided by concurrency), then the measured
-aggregate tok/s from `~/.local/state/local-llm/throughput.json`, and finally a
-clearly labelled default. The method used is stated in the output. Prompt and
-completion tokens have very different throughput — prefill is compute-bound
-and fast, decode memory-bandwidth-bound and slow — so billing both at one
-rate over-estimates prompt-heavy jobs badly. Note that the end-to-end item
-rate (`itemsCompleted / wallClockSeconds`) already includes the effect of
-concurrency; an ETA must never divide by the slot count again.
+With `--no-sample` (or if the sample fails, in which case plan falls back
+gracefully), the ETA comes from token rates instead — less accurate, and
+labelled as such: first separate prefill/decode rates (seconds/item = prompt
+tokens ÷ prefill rate + completion tokens ÷ decode rate, divided by
+concurrency), then the measured aggregate tok/s from
+`~/.local/state/local-llm/throughput.json`, and finally a clearly labelled
+default. The method used is stated in the output. Prompt and completion tokens
+have very different throughput — prefill is compute-bound and fast, decode
+memory-bandwidth-bound and slow — so billing both at one rate over-estimates
+prompt-heavy jobs badly. Note that any end-to-end item rate
+(`itemsCompleted / wallClockSeconds`) already includes the effect of
+concurrency; an ETA must never divide by the slot count again. bench's own
+items/s figure is deliberately never used for the ETA: it is measured on
+bench's long-generation prompt and does not transfer to other tasks.
 
 `local-llm bench` produces those measured rates. It times the model load,
 measures single-stream tok/s, measures the concurrent aggregate tok/s

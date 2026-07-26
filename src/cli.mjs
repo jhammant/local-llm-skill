@@ -369,10 +369,10 @@ async function planCommand(endpoint, options, args) {
   if (Boolean(options.template) === Boolean(options.prompt)) {
     throw new Error('plan requires exactly one of --template <file> or --prompt <text>');
   }
-  let probeSampleSize;
+  let timingSampleSize;
   if (options.sample != null) {
-    probeSampleSize = Number(options.sample);
-    if (!Number.isInteger(probeSampleSize) || probeSampleSize <= 0) {
+    timingSampleSize = Number(options.sample);
+    if (!Number.isInteger(timingSampleSize) || timingSampleSize <= 0) {
       throw new Error(`--sample requires a positive integer; received "${options.sample}"`);
     }
   }
@@ -390,8 +390,8 @@ async function planCommand(endpoint, options, args) {
       ? String(options.allow).split(',').map((v) => v.trim()).filter(Boolean)
       : null,
     reasoningEffort: options.reasoningEffort,
-    probe: !options.noSample,
-    ...(probeSampleSize == null ? {} : { probeSampleSize }),
+    sample: !options.noSample,
+    ...(timingSampleSize == null ? {} : { timingSampleSize }),
   });
 
   if (options.json) {

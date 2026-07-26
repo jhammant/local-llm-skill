@@ -1,16 +1,18 @@
 // Pre-flight estimator for batch runs: item count, token estimate, and ETA.
 //
 // Every figure this module produces is labelled by its basis — 'measured'
-// (read from ~/.local/state/local-llm/throughput.json, written by `bench`) or
-// 'assumed' (a stated default or heuristic). A fabricated-looking estimate is
-// worse than none, so the label travels with the number all the way to output.
-import { readFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
+// (a timed end-to-end sample of the actual job, or rates read from
+// ~/.local/state/local-llm/throughput.json written by `bench`) or 'assumed'
+// (a stated default or heuristic). A fabricated-looking estimate is worse
+// than none, so the label travels with the number all the way to output.
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ITEM_LINE, normalizeAnswer, substituteTemplate } from './batch.mjs';
+import { ITEM_LINE, normalizeAnswer, runBatch, substituteTemplate } from './batch.mjs';
 import * as lmstudio from './lmstudio.mjs';
 
 export const SAMPLE_SIZE = 20;
+export const TIMING_SAMPLE_SIZE = 8;
 export const PROBE_SAMPLE_SIZE = 3;
 export const ASSUMED_COMPLETION_TOKENS = 300;
 export const ASSUMED_TOK_PER_SEC = 30;
@@ -110,15 +112,18 @@ export function samplePromptTokens(items, template, sampleSize = SAMPLE_SIZE) {
   };
 }
 
-// Resolve the end-to-end rate for a model on an endpoint: a measured rate
-// from the throughput cache when present, else a clearly labelled assumption.
-// A record bench flagged unreliable (e.g. an impossible aggregate-below-
-// single-stream sample) is ignored — a noisy measurement is worse than none.
+// Resolve the token rates for a model on an endpoint: measured rates from the
+// throughput cache when present, else a clearly labelled assumption. A record
+// bench flagged unreliable (e.g. an impossible aggregate-below-single-stream
+// sample) is ignored — a noisy measurement is worse than none.
 //
 // Prompt and completion tokens have completely different throughput (prefill
-// is compute-bound, decode memory-bandwidth-bound, often 10-30x slower per
-// token), so the separate rates and the end-to-end itemsPerSec bench records
-// are surfaced alongside the legacy aggregate; planBatch picks between them.
+// is compute-bound and fast, decode memory-bandwidth-bound and slow, often
+// 10-30x per token), so the separate rates are surfaced alongside the legacy
+// aggregate; planBatch picks between them. bench's itemsPerSec is deliberately
+// NOT surfaced: bench measures items/s on its own long-generation prompt,
+// which does not transfer to other tasks — it predicted 2h58m for a
+// 3,803-item classification job that actually takes ~34 min.
 export function rateForModel(throughput, endpointId, model) {
   const entry = throughput?.[throughputKey(endpointId, model)];
   const usable = entry
@@ -131,7 +136,6 @@ export function rateForModel(throughput, endpointId, model) {
       tokPerSec: Number(entry.aggregateTokPerSec),
       promptTokPerSec: positive(entry.promptTokPerSec),
       completionTokPerSec: positive(entry.completionTokPerSec),
-      itemsPerSec: positive(entry.itemsPerSec),
       concurrency: Number.isFinite(Number(entry.concurrency)) ? Number(entry.concurrency) : null,
       source: `measured (bench ${entry.measuredAt ?? 'earlier'})`,
       measured: true,
@@ -144,7 +148,6 @@ export function rateForModel(throughput, endpointId, model) {
     tokPerSec: ASSUMED_TOK_PER_SEC,
     promptTokPerSec: null,
     completionTokPerSec: null,
-    itemsPerSec: null,
     concurrency: null,
     source: `assumed default (${ASSUMED_TOK_PER_SEC} tok/s aggregate) — ${reason}`,
     measured: false,
@@ -224,6 +227,106 @@ export async function measureCompletionTokens({
   };
 }
 
+// The only reliable way to predict a real batch is to time a real slice of
+// it. A sample of the ACTUAL items goes through runBatch itself — same
+// template, same concurrency detection, same --allow constrained-output
+// retries, same reasoning effort — and the wall clock is timed around it.
+// Retries are part of the real cost, so they must happen inside the timed
+// region, and the sample runs at the target concurrency, so the resulting
+// items/s already includes it (never divide by the slot count again).
+//
+// This exists because every token-rate extrapolation failed against ground
+// truth on a real 3,803-item classification job (laguna-s-2.1, ~1.87 items/s,
+// ~34 min): the single aggregate rate predicted 1h44m (3x over), bench's
+// items/s — measured on bench's own long-generation prompt — predicted 2h58m
+// (5x over), and separate prefill/decode rates predicted 7m (5x under, because
+// short requests are dominated by fixed per-request overhead no token-rate
+// model captures).
+//
+// Throws when the sample is not a valid measurement (any sampled item failed,
+// or a non-positive wall clock) so the caller can fall back to the token-rate
+// estimate. Returns null only when there is nothing to sample.
+export async function measureItemsPerSec({
+  endpoint,
+  model,
+  template,
+  items,
+  system,
+  allowed = null,
+  reasoningEffort,
+  sampleSize = TIMING_SAMPLE_SIZE,
+  concurrency = null,
+  client = lmstudio,
+  sleep,
+  now = Date.now,
+} = {}) {
+  const sample = sampleItems(items, sampleSize);
+  if (sample.length === 0) return null;
+  const directory = await mkdtemp(join(tmpdir(), 'local-llm-plan-sample-'));
+  const out = join(directory, 'sample.out.jsonl');
+  try {
+    const started = now();
+    const result = await runBatch({
+      endpoint,
+      model,
+      template,
+      system,
+      items: sample,
+      out,
+      concurrency,
+      reasoningEffort,
+      allowed,
+      client,
+      // A plan must not mutate ration/LRU state as a side effect of estimating.
+      touchFn: async () => {},
+      ...(sleep == null ? {} : { sleep }),
+    });
+    const wallClockSeconds = (now() - started) / 1000;
+    if (result.ok < sample.length) {
+      throw new Error(`${result.failed} of ${sample.length} sampled item(s) failed`);
+    }
+    if (!Number.isFinite(wallClockSeconds) || wallClockSeconds <= 0) {
+      throw new Error(`sample wall clock was not positive (${wallClockSeconds}s)`);
+    }
+
+    // Reuse the sample's API-reported usage for measured prompt/completion
+    // tokens per item, replacing the chars/4 heuristic and the 300-token
+    // assumption. null when the API did not report usage for every record.
+    const records = (await readFile(out, 'utf8'))
+      .split('\n')
+      .filter((line) => line.trim() !== '')
+      .map((line) => JSON.parse(line));
+    let promptTotal = 0;
+    let promptCount = 0;
+    let completionTotal = 0;
+    let completionCount = 0;
+    for (const record of records) {
+      const promptTokens = Number(record.usage?.prompt_tokens ?? record.usage?.input_tokens);
+      const completionTokens = Number(record.usage?.completion_tokens ?? record.usage?.output_tokens);
+      if (Number.isFinite(promptTokens)) {
+        promptTotal += promptTokens;
+        promptCount += 1;
+      }
+      if (Number.isFinite(completionTokens)) {
+        completionTotal += completionTokens;
+        completionCount += 1;
+      }
+    }
+    const round1 = (value) => Math.round(value * 10) / 10;
+    return {
+      sampled: sample.length,
+      itemsPerSec: sample.length / wallClockSeconds,
+      wallClockSeconds,
+      promptTokensPerItem:
+        records.length > 0 && promptCount === records.length ? round1(promptTotal / promptCount) : null,
+      completionTokensPerItem:
+        records.length > 0 && completionCount === records.length ? round1(completionTotal / completionCount) : null,
+    };
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 export async function planBatch({
   endpoint,
   model,
@@ -233,10 +336,15 @@ export async function planBatch({
   completionTokensPerItem = null,
   probe = true,
   probeSampleSize = PROBE_SAMPLE_SIZE,
+  sample = true,
+  timingSampleSize = TIMING_SAMPLE_SIZE,
+  concurrency = null,
   system,
   allowed = null,
   reasoningEffort,
   client = lmstudio,
+  sleep,
+  now,
   ...options
 } = {}) {
   if (!endpoint || typeof endpoint !== 'object' || typeof endpoint.id !== 'string') {
@@ -247,21 +355,63 @@ export async function planBatch({
   }
   if (!Array.isArray(items)) throw new Error('Plan items must be an array');
 
-  const prompt = samplePromptTokens(items, template, sampleSize);
+  const itemCount = items.length;
   const throughput = await readThroughput(options);
   const rate = rateForModel(throughput, endpoint.id, model);
+  const measuredSource = (n) => `measured (end-to-end sample of ${n} items)`;
 
-  // Completion length: an explicit override, else a live probe of the model,
-  // else the stated 300-token assumption. A failed probe must never crash the
-  // plan — fall back to the assumption and say so in the label.
+  // ETA, in order of preference:
+  // (a) a timed end-to-end sample of the ACTUAL job — the only reliable
+  //     predictor, because short requests are dominated by fixed per-request
+  //     overhead that no token-rate model captures (see measureItemsPerSec);
+  // (b) separate prefill/decode rates — prefill is compute-bound and fast,
+  //     decode memory-bandwidth-bound and slow, so seconds/item is
+  //     promptTokens/promptTokPerSec + completionTokens/completionTokPerSec,
+  //     scaled down by the model's parallel slots;
+  // (c) the legacy single aggregate rate — least accurate, because it bills
+  //     prompt tokens at the decode rate (this over-estimated a real
+  //     3,803-item job by 3x: 1h44m predicted vs ~34m actual).
+  // bench's itemsPerSec is deliberately absent from this list (see
+  // rateForModel). A failed sample must never crash the plan — fall back to
+  // the token-rate methods and say so in the label.
+  let measured = null;
+  let sampleError = null;
+  if (sample && itemCount > 0) {
+    try {
+      measured = await measureItemsPerSec({
+        endpoint,
+        model,
+        template,
+        items,
+        system,
+        allowed,
+        reasoningEffort,
+        sampleSize: timingSampleSize,
+        concurrency,
+        client,
+        ...(sleep == null ? {} : { sleep }),
+        ...(now == null ? {} : { now }),
+      });
+    } catch (error) {
+      sampleError = error;
+    }
+  }
+
+  // Completion tokens/item: an explicit override, else the measured sample,
+  // else a live probe of the model, else the stated 300-token assumption.
   let completion;
   if (completionTokensPerItem != null) {
     completion = { value: completionTokensPerItem, source: 'assumed default' };
+  } else if (measured?.completionTokensPerItem != null) {
+    completion = {
+      value: measured.completionTokensPerItem,
+      source: measuredSource(measured.sampled),
+    };
   } else if (!probe) {
     completion = { value: ASSUMED_COMPLETION_TOKENS, source: 'assumed default' };
   } else {
     try {
-      const measured = await measureCompletionTokens({
+      const probed = await measureCompletionTokens({
         endpoint,
         model,
         template,
@@ -272,11 +422,11 @@ export async function planBatch({
         sampleSize: probeSampleSize,
         client,
       });
-      completion = measured == null
+      completion = probed == null
         ? { value: ASSUMED_COMPLETION_TOKENS, source: 'assumed default' }
         : {
-          value: measured.completionTokensPerItem,
-          source: `measured (n=${measured.sampled} sample)`,
+          value: probed.completionTokensPerItem,
+          source: `measured (n=${probed.sampled} sample)`,
         };
     } catch (error) {
       completion = {
@@ -286,33 +436,44 @@ export async function planBatch({
     }
   }
 
-  const itemCount = items.length;
+  // Prompt tokens/item: the sample's API-reported prompt_tokens when
+  // available, else the chars/4 heuristic (always labelled 'assumed').
+  const prompt = measured?.promptTokensPerItem != null
+    ? {
+      sampled: measured.sampled,
+      promptTokensPerItem: measured.promptTokensPerItem,
+      source: measuredSource(measured.sampled),
+    }
+    : samplePromptTokens(items, template, sampleSize);
+
   const tokensPerItem = prompt.promptTokensPerItem + completion.value;
   const totalTokens = tokensPerItem * itemCount;
 
-  // ETA, in order of preference:
-  // (a) bench's measured end-to-end items/s — the most reliable predictor, and
-  //     it already includes concurrency, so never divide by the slot count;
-  // (b) separate prefill/decode rates — prefill is compute-bound and fast,
-  //     decode memory-bandwidth-bound and slow, so seconds/item is
-  //     promptTokens/promptTokPerSec + completionTokens/completionTokPerSec,
-  //     scaled down by the model's parallel slots;
-  // (c) the legacy single aggregate rate — least accurate, because it bills
-  //     prompt tokens at the decode rate (this over-estimated a real
-  //     3,803-item job by 3x: 1h44m predicted vs ~34m actual).
   let etaSeconds = null;
   let etaMethod;
-  if (rate.itemsPerSec != null) {
-    etaSeconds = itemCount / rate.itemsPerSec;
-    etaMethod = 'measured items/s (most reliable)';
-  } else if (rate.promptTokPerSec != null && rate.completionTokPerSec != null) {
-    const secondsPerItem = prompt.promptTokensPerItem / rate.promptTokPerSec
-      + completion.value / rate.completionTokPerSec;
-    etaSeconds = (secondsPerItem * itemCount) / (rate.concurrency ?? 1);
-    etaMethod = 'separate prefill/decode rates';
+  let itemsPerSec = null;
+  if (measured != null) {
+    const eta = estimateEtaSeconds({
+      totalItems: itemCount,
+      itemsCompleted: measured.sampled,
+      wallClockSeconds: measured.wallClockSeconds,
+    });
+    etaSeconds = eta.etaSeconds;
+    etaMethod = measuredSource(measured.sampled);
+    itemsPerSec = { value: eta.itemsPerSec, source: etaMethod };
   } else {
-    etaSeconds = rate.tokPerSec > 0 ? totalTokens / rate.tokPerSec : null;
-    etaMethod = 'single aggregate rate (least accurate — prompt tokens billed at the decode rate)';
+    const sampleNote = sampleError ? ` (end-to-end sample failed: ${sampleError.message})` : '';
+    if (rate.promptTokPerSec != null && rate.completionTokPerSec != null) {
+      const secondsPerItem = prompt.promptTokensPerItem / rate.promptTokPerSec
+        + completion.value / rate.completionTokPerSec;
+      etaSeconds = (secondsPerItem * itemCount) / (rate.concurrency ?? 1);
+      etaMethod = 'separate prefill/decode rates (token-rate estimate; misses fixed per-request overhead)'
+        + sampleNote;
+    } else {
+      etaSeconds = rate.tokPerSec > 0 ? totalTokens / rate.tokPerSec : null;
+      etaMethod = 'single aggregate rate (least accurate — prompt tokens billed at the decode rate)'
+        + sampleNote;
+    }
   }
 
   return {
@@ -322,6 +483,7 @@ export async function planBatch({
     sample: prompt,
     completionTokensPerItem: completion,
     rate,
+    itemsPerSec,
     tokensPerItem,
     totalTokens,
     etaSeconds,
