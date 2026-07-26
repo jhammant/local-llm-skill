@@ -153,7 +153,108 @@ test('ollama unload sends keep_alive: 0, never an unload endpoint', async () => 
   assert.equal(captured[0].body.model, 'qwen3:8b');
 });
 
-// 4. unmanaged degradation: budget reports managed:false with nulls, admit
+// 4. ollama capability enrichment: /api/tags has NO capabilities array, so
+// listModels consults POST /api/show per model (bounded, cached, failure-
+// tolerant). Ollama's "tools" maps to the internal "tool_use".
+function ollamaShowFetch(tags, showFor, showCalls = []) {
+  return async (url, init = {}) => {
+    if (url.endsWith('/api/tags')) {
+      return { ok: true, status: 200, async text() { return JSON.stringify(tags); } };
+    }
+    if (url.endsWith('/api/show')) {
+      const { model } = JSON.parse(init.body);
+      showCalls.push(model);
+      const result = showFor(model);
+      if (result instanceof Error) throw result;
+      return { ok: true, status: 200, async text() { return JSON.stringify(result); } };
+    }
+    return { ok: false, status: 404, async text() { return 'not found'; } };
+  };
+}
+
+const admissiblePlan = async () => ({
+  ok: true, action: 'already-loaded', evicted: [], reason: 'test',
+});
+
+// selectModel calls provider.listModels(endpoint) without options, so the
+// fake fetch is injected by wrapping the provider's listModels.
+function ollamaWith(fetchFn) {
+  return { ...ollama, listModels: (endpoint) => ollama.listModels(endpoint, { fetchFn }) };
+}
+
+test('ollama /api/show capabilities decide the coder class, not size', async () => {
+  // Model names are unique per test: /api/show answers are cached per model
+  // name for the process lifetime.
+  const fetchFn = ollamaShowFetch(
+    {
+      models: [
+        { name: 'showtest-coder:32b', size: 20e9, details: { family: 'qwen2' } },
+        { name: 'showtest-small:1b', size: 1e9, details: { family: 'llama' } },
+      ],
+    },
+    (model) => (model === 'showtest-coder:32b'
+      ? { capabilities: ['completion', 'tools', 'insert'] }
+      : { capabilities: ['completion'] }),
+  );
+  const selected = await selectModel({
+    class: 'coder',
+    endpoint: ollamaEndpoint,
+    client: ollamaWith(fetchFn),
+    admitFn: admissiblePlan,
+  });
+  assert.equal(selected.id, 'showtest-coder:32b', 'the model with tool_use wins, not the smallest');
+  assert.equal(selected.class, 'coder', 'no fall-through to workhorse or reflex');
+});
+
+test('a model whose /api/show fails has unknown capabilities and stays selectable', async () => {
+  const fetchFn = ollamaShowFetch(
+    { models: [{ name: 'showtest-flaky:7b', size: 5e9, details: { family: 'qwen3' } }] },
+    () => new Error('boom'),
+  );
+  const models = await ollama.listModels(ollamaEndpoint, { fetchFn });
+  assert.equal(models[0].capabilities, null, 'a failed /api/show means unknown, not none');
+
+  const selected = await selectModel({
+    class: 'coder',
+    endpoint: ollamaEndpoint,
+    client: ollamaWith(fetchFn),
+    admitFn: admissiblePlan,
+  });
+  assert.equal(selected.id, 'showtest-flaky:7b');
+  assert.equal(selected.class, 'coder', 'unknown capabilities are not a denial');
+});
+
+test('/api/show capabilities can mark an embedding model the family heuristics miss', async () => {
+  const fetchFn = ollamaShowFetch(
+    { models: [{ name: 'showtest-vectors:latest', size: 3e8, details: { family: 'qwen3' } }] },
+    () => ({ capabilities: ['embedding'] }),
+  );
+  const models = await ollama.listModels(ollamaEndpoint, { fetchFn });
+  assert.equal(models[0].type, 'embeddings');
+});
+
+test('/api/show is requested at most once per model name across selections', async () => {
+  const showCalls = [];
+  const fetchFn = ollamaShowFetch(
+    {
+      models: [
+        { name: 'showtest-cache-a:8b', size: 5e9, details: { family: 'qwen3' } },
+        { name: 'showtest-cache-b:8b', size: 6e9, details: { family: 'llama' } },
+      ],
+    },
+    () => ({ capabilities: ['completion', 'tools'] }),
+    showCalls,
+  );
+  const client = ollamaWith(fetchFn);
+  for (let i = 0; i < 2; i += 1) {
+    await selectModel({
+      class: 'workhorse', endpoint: ollamaEndpoint, client, admitFn: admissiblePlan,
+    });
+  }
+  assert.deepEqual([...showCalls].sort(), ['showtest-cache-a:8b', 'showtest-cache-b:8b']);
+});
+
+// 5. unmanaged degradation: budget reports managed:false with nulls, admit
 // steps aside with ok:true, nothing throws, nothing is invented.
 test('an unmanaged backend degrades budget and admit without throwing', async (t) => {
   const options = await rationFixture(t);
@@ -187,7 +288,7 @@ test('an unmanaged backend degrades budget and admit without throwing', async (t
   );
 });
 
-// 5. catalog selection without sizes still returns a model, says so in why,
+// 6. catalog selection without sizes still returns a model, says so in why,
 // and a null size never sorts as smallest.
 test('catalog without sizes selects on hints and says so in why', async () => {
   const endpoint = { id: 'remote', kind: 'openai', baseUrl: 'http://fake.test', control: 'none' };
@@ -225,7 +326,7 @@ test('a null size never sorts as smallest', () => {
   assert.equal(ranked[1].model.id, 'unknown-size');
 });
 
-// 6. auto-detection registers whichever backends answer, both or neither.
+// 7. auto-detection registers whichever backends answer, both or neither.
 test('auto-detection registers both backends when both probes succeed', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'local-llm-detect-'));
   t.after(() => rm(directory, { recursive: true, force: true }));

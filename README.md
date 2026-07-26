@@ -35,6 +35,51 @@ It runs on Node 18+ with **no runtime dependencies**, needs LM Studio's server
 running, and resolves the `lms` binary from `LMS_BIN`, `which lms`, or
 `~/.lmstudio/bin/lms` in that order.
 
+## Backends
+
+Works with **LM Studio**, **Ollama**, or any **OpenAI-compatible** server (vLLM,
+llama.cpp server, LiteLLM, a remote host). With no configuration it probes
+`127.0.0.1:1234` and `127.0.0.1:11434` and registers whichever answers.
+
+```text
+$ local-llm endpoints
+ID      KIND      URL                     REACHABLE  CAPABILITIES
+local   lmstudio  http://127.0.0.1:1234   yes        sizes loadedState load unload embed
+ollama  ollama    http://127.0.0.1:11434  yes        sizes loadedState load unload embed
+```
+
+Backends differ in what they can tell you, and the tool degrades honestly
+rather than guessing:
+
+| | LM Studio | Ollama | generic OpenAI |
+|---|---|---|---|
+| model sizes | yes | yes | **no** |
+| loaded state | yes | yes | **no** |
+| load / unload | yes | yes (`keep_alive`) | **no** |
+| memory management | full | full | **unmanaged** |
+
+On an endpoint that cannot report sizes or loaded state, `budget` reports
+`managed: false` with no usage figures, admission returns `unmanaged` and never
+blocks a run, and `pin` fails loudly instead of recording something that could
+never take effect. A missing size is never treated as zero — that would make an
+unknown model look like the smallest and win every `reflex` selection.
+
+Add endpoints explicitly in `~/.config/local-llm/endpoints.json`:
+
+```json
+{
+  "endpoints": [
+    { "id": "ollama", "kind": "ollama", "baseUrl": "http://127.0.0.1:11434" },
+    { "id": "remote", "kind": "openai", "baseUrl": "https://my-vllm.example.com",
+      "apiKeyEnv": "MY_VLLM_KEY" }
+  ]
+}
+```
+
+An API key is read from the named environment variable, never stored in the file.
+Entries written before multi-backend support have no `kind` and are treated as
+LM Studio, so existing configs keep working.
+
 ## Install
 
 From this directory:

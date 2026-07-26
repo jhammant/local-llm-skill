@@ -12,6 +12,7 @@ export const capabilities = Object.freeze({
   load: false,
   unload: false,
   embed: false,
+  toolInfo: false,
 });
 
 export async function listModels(endpoint, options = {}) {

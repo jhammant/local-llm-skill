@@ -33,12 +33,17 @@ const UNCENSORED = /abliterat|uncensor|heretic|dolphin/i;
 
 // `size` picks how to order admissible candidates:
 //   'smallest' — cheapest that can do the job (throughput matters most)
-//   'largest'  — most capable that fits
-//   'balanced' — biggest model under `cap` × budget, else smallest available
+//   'largest'  — most capable that fits; admission handles eviction
+//   'balanced' — prefers models under `cap` x budget, and among those the
+//                SMALLER one. Right for high-volume classes where a cheaper
+//                model run thousands of times beats a better one run slowly.
+// Single-shot classes that want the most capable model use 'largest', not
+// 'balanced' — on a catalog holding both a 7b and a 32b coder, 'balanced'
+// would pick the 7b.
 export const JOB_CLASSES = Object.freeze({
   reflex: { type: 'text', size: 'smallest', hint: null },
   workhorse: { type: 'text', size: 'balanced', cap: 0.4, hint: HINTS.instruct },
-  coder: { type: 'text', size: 'balanced', cap: 0.75, hint: HINTS.coder, tools: true },
+  coder: { type: 'text', size: 'largest', hint: HINTS.coder, tools: true },
   heavy: { type: 'text', size: 'largest', hint: HINTS.reasoning },
   vision: { type: 'vlm', size: 'balanced', cap: 0.4, hint: HINTS.vision },
   embed: { type: 'embeddings', size: 'smallest', hint: HINTS.embed },
@@ -132,6 +137,12 @@ export async function selectModel({
   const sizesAvailable = provider.capabilities?.sizes !== false
     && models.some((model) => Number.isFinite(model?.sizeGb));
 
+  // Same principle for tool_use: a backend that cannot report capabilities
+  // (toolInfo: false) must not hard-filter on them, and neither may a model
+  // whose capabilities are unknown (null, e.g. a failed lookup). Absence of
+  // information is not denial — only a KNOWN-empty capability list excludes.
+  const toolInfoAvailable = provider.capabilities?.toolInfo !== false;
+
   for (const candidateClass of FALLBACKS[requestedClass]) {
     const spec = JOB_CLASSES[candidateClass];
 
@@ -154,7 +165,9 @@ export async function selectModel({
 
     for (const { model } of ordered) {
       const needTools = requireTools || spec.tools === true;
-      if (needTools && !model.capabilities?.includes('tool_use')) {
+      if (needTools && toolInfoAvailable
+          && Array.isArray(model.capabilities)
+          && !model.capabilities.includes('tool_use')) {
         rejected.push(`${model.id}: no tool_use`);
         continue;
       }
@@ -178,7 +191,10 @@ export async function selectModel({
           `${model.quantization ? ', ' + model.quantization : ''}` +
           `${Number.isFinite(model.sizeGb) ? ', ' + model.sizeGb.toFixed(1) + 'GB' : ''}` +
           `; admission ${plan.action}` +
-          `${sizesAvailable ? '' : '; selected without size information'}`,
+          `${sizesAvailable ? '' : '; selected without size information'}` +
+          `${needTools && !toolInfoAvailable
+            ? '; tool support unverified (backend does not report capabilities)'
+            : ''}`,
       };
     }
   }

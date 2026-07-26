@@ -22,6 +22,7 @@ export const capabilities = Object.freeze({
   load: true,
   unload: true,
   embed: true,
+  toolInfo: true,
 });
 
 const ANSI_PATTERN = [
