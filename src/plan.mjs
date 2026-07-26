@@ -112,9 +112,15 @@ export function samplePromptTokens(items, template, sampleSize = SAMPLE_SIZE) {
 
 // Resolve the end-to-end rate for a model on an endpoint: a measured rate
 // from the throughput cache when present, else a clearly labelled assumption.
+// A record bench flagged unreliable (e.g. an impossible aggregate-below-
+// single-stream sample) is ignored — a noisy measurement is worse than none.
 export function rateForModel(throughput, endpointId, model) {
   const entry = throughput?.[throughputKey(endpointId, model)];
-  if (entry && Number.isFinite(Number(entry.aggregateTokPerSec)) && Number(entry.aggregateTokPerSec) > 0) {
+  const usable = entry
+    && entry.warning == null
+    && Number.isFinite(Number(entry.aggregateTokPerSec))
+    && Number(entry.aggregateTokPerSec) > 0;
+  if (usable) {
     return {
       tokPerSec: Number(entry.aggregateTokPerSec),
       concurrency: Number.isFinite(Number(entry.concurrency)) ? Number(entry.concurrency) : null,
@@ -122,10 +128,13 @@ export function rateForModel(throughput, endpointId, model) {
       measured: true,
     };
   }
+  const reason = entry?.warning != null
+    ? `unreliable bench measurement ignored (${entry.warning}); re-run "local-llm bench --model ${model}"`
+    : `run "local-llm bench --model ${model}" to measure`;
   return {
     tokPerSec: ASSUMED_TOK_PER_SEC,
     concurrency: null,
-    source: `assumed default (${ASSUMED_TOK_PER_SEC} tok/s aggregate) — run "local-llm bench --model ${model}" to measure`,
+    source: `assumed default (${ASSUMED_TOK_PER_SEC} tok/s aggregate) — ${reason}`,
     measured: false,
   };
 }

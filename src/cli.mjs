@@ -36,6 +36,8 @@ const VALUE_OPTIONS = new Set([
   'concurrency',
   'allow',
   'sample',
+  'max-tokens',
+  'runs',
   'reasoning-effort',
 ]);
 const BOOLEAN_OPTIONS = new Set([
@@ -65,7 +67,7 @@ Usage:
   local-llm plan <items.jsonl> (--template f | --prompt s)
       [--class c] [--model m] [--field name] [--allow a,b,c]
       [--reasoning-effort e] [--sample n] [--no-sample] [--json]
-  local-llm bench [--model m] [--class c] [--json]
+  local-llm bench [--model m] [--class c] [--max-tokens n] [--runs n] [--json]
   local-llm load <model> [--dry-run] [--json]
   local-llm unload <identifier | --all> [--json]
   local-llm pin <model> | unpin <model> | pins [--json]
@@ -408,9 +410,20 @@ async function planCommand(endpoint, options, args) {
   );
 }
 
+function positiveIntegerOption(options, name) {
+  if (options[name] == null) return undefined;
+  const value = Number(options[name]);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`--${name.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)} requires a positive integer; received "${options[name]}"`);
+  }
+  return value;
+}
+
 async function benchCommand(endpoint, options) {
   const model = await resolveBatchModel(endpoint, options);
-  const result = await runBench({ endpoint, model });
+  const maxTokens = positiveIntegerOption(options, 'maxTokens');
+  const runs = positiveIntegerOption(options, 'runs');
+  const result = await runBench({ endpoint, model, maxTokens, runs });
   const cachePath = await recordThroughput(result);
 
   if (options.json) {
@@ -421,8 +434,9 @@ async function benchCommand(endpoint, options) {
     [
       `Bench of ${result.model} on endpoint "${result.endpoint}"`,
       `  model load:          ${result.loadSeconds.toFixed(1)} s`,
-      `  single stream:       ${result.singleTokPerSec.toFixed(1)} tok/s (measured)`,
+      `  single stream:       ${result.singleTokPerSec.toFixed(1)} tok/s (mean of ${result.runs} run(s) at ${result.maxTokens} max tokens)`,
       `  ${result.concurrency}-way aggregate:  ${result.aggregateTokPerSec.toFixed(1)} tok/s (measured)`,
+      ...(result.warning ? [`  WARNING: ${result.warning}`] : []),
       `  recorded to ${cachePath}`,
     ].join('\n') + '\n',
   );

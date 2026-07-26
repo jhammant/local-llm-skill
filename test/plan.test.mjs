@@ -130,6 +130,41 @@ test('planBatch uses a measured rate from the throughput cache', async (t) => {
   assert.ok(Math.abs(plan.etaSeconds - expected) < 1e-6);
 });
 
+test('planBatch ignores a bench record flagged unreliable', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'local-llm-plan-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const throughputPath = join(directory, 'throughput.json');
+  await writeFile(throughputPath, JSON.stringify({
+    'local/noisy-model': {
+      endpoint: 'local',
+      model: 'noisy-model',
+      singleTokPerSec: 64,
+      aggregateTokPerSec: 32,
+      concurrency: 4,
+      maxTokens: 512,
+      runs: 3,
+      warning: 'unreliable (aggregate below single-stream)',
+      measuredAt: '2026-07-25T00:00:00.000Z',
+    },
+  }));
+
+  const plan = await planBatch({
+    endpoint,
+    model: 'noisy-model',
+    template: '{{text}}',
+    items: Array.from({ length: 40 }, () => ({ text: 'aaaa' })),
+    throughputPath,
+    probe: false,
+  });
+
+  // An impossible measurement must not drive the ETA — fall back to the
+  // labelled assumed default instead.
+  assert.equal(plan.rate.measured, false);
+  assert.equal(plan.rate.tokPerSec, 30);
+  assert.match(plan.rate.source, /assumed default/);
+  assert.match(plan.rate.source, /unreliable bench measurement ignored/);
+});
+
 test('planBatch probes the model: a 3-token completion shrinks the estimate ~100x', async (t) => {
   const directory = await mkdtemp(join(tmpdir(), 'local-llm-plan-'));
   t.after(() => rm(directory, { recursive: true, force: true }));

@@ -5,15 +5,28 @@
 // Concurrency scales sub-linearly on Apple unified memory (it is memory-
 // bandwidth-bound, not compute-bound), so the aggregate is measured directly —
 // never estimated as singleRate × slots, which overstates it badly.
+//
+// Short samples are noise: a single 128-token generation is dominated by
+// startup latency and prompt processing, and once produced a 4-way aggregate
+// BELOW the single-stream rate — physically impossible for a batching server.
+// So: warm up first (the first call after load pays one-off costs), generate
+// at least 256 tokens against a prompt that reliably produces a long answer,
+// and average the single-stream figure over several runs. If the aggregate
+// still comes out below the single-stream rate the sample was too noisy —
+// retry once with double the token budget, and if it still inverts, record
+// the figures flagged UNRELIABLE rather than silently caching an impossible
+// measurement.
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import * as lmstudio from './lmstudio.mjs';
 import { admit } from './ration.mjs';
 import { throughputKey, throughputPath } from './plan.mjs';
 
-const BENCH_PROMPT = 'Explain, in a few sentences, how a hash map resolves collisions.';
-const BENCH_MAX_TOKENS = 128;
+const BENCH_PROMPT = 'Write a detailed essay of at least 300 words explaining how a hash map resolves collisions, covering both chaining and open addressing with worked examples.';
+const BENCH_MAX_TOKENS = 256;
+const DEFAULT_RUNS = 3;
 const DEFAULT_CONCURRENCY = 4;
+export const UNRELIABLE_WARNING = 'unreliable (aggregate below single-stream)';
 
 function completionTokens(usage) {
   const value = usage?.completion_tokens ?? usage?.output_tokens ?? 0;
@@ -44,6 +57,7 @@ export async function runBench({
   concurrency,
   prompt = BENCH_PROMPT,
   maxTokens = BENCH_MAX_TOKENS,
+  runs = DEFAULT_RUNS,
   nowFn = () => Date.now(),
 } = {}) {
   if (!endpoint || typeof endpoint !== 'object' || typeof endpoint.id !== 'string') {
@@ -54,6 +68,12 @@ export async function runBench({
   }
   if (typeof client.chat !== 'function') {
     throw new Error('The bench client must implement chat()');
+  }
+  if (!Number.isInteger(runs) || runs <= 0) {
+    throw new Error(`Bench runs must be a positive integer; received "${runs}"`);
+  }
+  if (!Number.isInteger(maxTokens) || maxTokens <= 0) {
+    throw new Error(`Bench maxTokens must be a positive integer; received "${maxTokens}"`);
   }
 
   // Time the load separately — first-request latency on a cold model would
@@ -67,27 +87,48 @@ export async function runBench({
 
   const messages = [{ role: 'user', content: prompt }];
 
-  // Single stream.
-  const singleStarted = nowFn();
-  const single = await client.chat(endpoint, { model, messages, maxTokens });
-  const singleSeconds = Math.max(0.001, (nowFn() - singleStarted) / 1_000);
-  const singleTokens = completionTokens(single.usage);
-  const singleTokPerSec = singleTokens / singleSeconds;
+  // Warm-up: the first call after load pays one-off costs (cache fills, JIT-
+  // style warm paths). Discard it — it is never timed.
+  await client.chat(endpoint, { model, messages, maxTokens });
 
-  // Concurrent aggregate across the model's advertised PARALLEL slots.
   const slots = concurrency == null
     ? await resolveConcurrency(endpoint, model, client)
     : concurrency;
   if (!Number.isInteger(slots) || slots <= 0) {
     throw new Error(`Bench concurrency must be a positive integer; received "${slots}"`);
   }
-  const concurrentStarted = nowFn();
-  const results = await Promise.all(
-    Array.from({ length: slots }, () => client.chat(endpoint, { model, messages, maxTokens })),
-  );
-  const concurrentSeconds = Math.max(0.001, (nowFn() - concurrentStarted) / 1_000);
-  const concurrentTokens = results.reduce((sum, result) => sum + completionTokens(result.usage), 0);
-  const aggregateTokPerSec = concurrentTokens / concurrentSeconds;
+
+  const measure = async (tokenBudget) => {
+    // Single stream, averaged over `runs` runs to damp sample noise.
+    let singleTokPerSec = 0;
+    for (let run = 0; run < runs; run += 1) {
+      const singleStarted = nowFn();
+      const single = await client.chat(endpoint, { model, messages, maxTokens: tokenBudget });
+      const singleSeconds = Math.max(0.001, (nowFn() - singleStarted) / 1_000);
+      singleTokPerSec += completionTokens(single.usage) / singleSeconds;
+    }
+    singleTokPerSec /= runs;
+
+    // Concurrent aggregate across the model's advertised PARALLEL slots.
+    const concurrentStarted = nowFn();
+    const results = await Promise.all(
+      Array.from({ length: slots }, () => client.chat(endpoint, { model, messages, maxTokens: tokenBudget })),
+    );
+    const concurrentSeconds = Math.max(0.001, (nowFn() - concurrentStarted) / 1_000);
+    const concurrentTokens = results.reduce((sum, result) => sum + completionTokens(result.usage), 0);
+    return { singleTokPerSec, aggregateTokPerSec: concurrentTokens / concurrentSeconds };
+  };
+
+  let tokenBudget = maxTokens;
+  let { singleTokPerSec, aggregateTokPerSec } = await measure(tokenBudget);
+  let warning = null;
+  if (aggregateTokPerSec < singleTokPerSec) {
+    // Impossible for a batching server — the sample was too noisy. Retry once
+    // with double the token budget so generation dominates the fixed costs.
+    tokenBudget = maxTokens * 2;
+    ({ singleTokPerSec, aggregateTokPerSec } = await measure(tokenBudget));
+    if (aggregateTokPerSec < singleTokPerSec) warning = UNRELIABLE_WARNING;
+  }
 
   return {
     endpoint: endpoint.id,
@@ -97,7 +138,9 @@ export async function runBench({
     concurrency: slots,
     loadSeconds,
     prompt,
-    maxTokens,
+    maxTokens: tokenBudget,
+    runs,
+    warning,
     measuredAt: new Date().toISOString(),
   };
 }
