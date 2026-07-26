@@ -30,7 +30,10 @@ local-llm budget [--json]
 local-llm ask <prompt…> [--class c] [--model m] [--uncensored] [--json]
 local-llm batch <items.jsonl> (--template f | --prompt s) [--out f]
     [--class c] [--model m] [--field name] [--system f]
-    [--concurrency n] [--restart] [--dry-run] [--json]
+    [--concurrency n] [--allow a,b,c] [--restart] [--dry-run] [--json]
+local-llm plan <items.jsonl> (--template f | --prompt s)
+    [--class c] [--model m] [--field name] [--json]
+local-llm bench [--model m] [--class c] [--json]
 local-llm load <model> [--dry-run] [--json]
 local-llm unload <identifier | --all> [--json]
 local-llm pin <model>
@@ -119,6 +122,44 @@ not name a file, it is treated as literal system text. Use `--dry-run` to
 validate input and show the admission plan without loading, unloading, or
 creating output.
 
+For constrained classification jobs, `--allow a,b,c` restricts the answer to
+an exact set of values. A reply that is not in the set is retried with the
+constraint restated; a reply that recovers unambiguously (e.g. `**positive**`
+or "The label is positive") is canonicalised to the permitted value and the
+raw text is kept in a `raw` field. Genuinely ambiguous replies are recorded as
+failures rather than silently guessed.
+
+## Estimating and benchmarking
+
+`local-llm plan` estimates a batch before you run it: item count, tokens per
+item (from sampling ~20 items through the template), total tokens, and an ETA.
+Every figure is labelled by its basis — measured or assumed:
+
+```sh
+local-llm plan reviews.jsonl --template classify.txt --class workhorse
+```
+
+The ETA uses the measured aggregate tok/s for the model from
+`~/.local/state/local-llm/throughput.json` when present, and a clearly
+labelled default otherwise. Note that the end-to-end item rate
+(`itemsCompleted / wallClockSeconds`) already includes the effect of
+concurrency; an ETA must never divide by the slot count again.
+
+`local-llm bench` produces those measured rates. It times the model load,
+measures single-stream tok/s, then measures the concurrent aggregate tok/s
+across the model's advertised `PARALLEL` slots, and records all three in the
+throughput cache:
+
+```sh
+local-llm bench --model qwen3-coder-next
+```
+
+The aggregate is measured directly, never estimated as
+`single-stream rate × slots`: concurrency scales sub-linearly on Apple unified
+memory because inference is memory-bandwidth-bound, not compute-bound (on one
+M5 Max, 4 slots bought ~1.5×, not 4×). Multiplying the single-stream rate by
+the slot count would overstate throughput several-fold.
+
 ## Memory budget and admission
 
 The limiting resource is unified memory, not a token quota. `local-llm`
@@ -129,14 +170,21 @@ inference budget = GPU wired-memory ceiling - OS/app reserve
 free budget      = inference budget - sizes of loaded models
 ```
 
-The wired-memory ceiling comes from
-`sysctl -n iogpu.wired_limit_mb`. A value of `0` means no explicit setting, so
-the ceiling defaults to 75% of physical RAM. The reserve defaults to 12 GB.
-Override it with `LOCAL_LLM_RESERVE_GB` or place the following in
+The wired-memory ceiling is platform-specific:
+
+| host | ceiling source |
+|---|---|
+| macOS (Apple Silicon) | `sysctl -n iogpu.wired_limit_mb`; `0` (unset) → 75% of unified memory |
+| Linux / Windows + NVIDIA | total VRAM from `nvidia-smi --query-gpu=memory.total` |
+| anything else / detection fails | 60% of system RAM, clearly labelled a fallback |
+
+`local-llm budget` prints which source produced the number, so on an
+unsupported host you can see why it is what it is. Override it with
+`LOCAL_LLM_CEILING_GB` / `LOCAL_LLM_RESERVE_GB` or place the following in
 `~/.config/local-llm/config.json`:
 
 ```json
-{"reserveGb":16}
+{"ceilingGb":90,"reserveGb":16}
 ```
 
 When a requested model does not fit, the tool evicts loaded models from the
@@ -154,16 +202,33 @@ it. Inspect the calculation with `local-llm budget` and preview admission with
 ## Model classes
 
 The default batch class is `workhorse`. Other classes are `reflex`, `coder`,
-`heavy`, `vision`, `embed`, and `security`. Each class has an ordered preference
-list and can fall back to a smaller general-purpose class when its preferred
-models are absent or inadmissible. Tool-requiring callers only select models
-that advertise `tool_use`.
+`heavy`, `vision`, `embed`, and `security`.
 
-The `security` class contains abliterated or uncensored models and is never
-auto-selected. It requires an explicit `--class security` or `--uncensored`.
-These models trade instruction-following and factual accuracy for the absence
-of refusals. They are a fallback for false refusals during authorized security
-work, not a general-purpose model choice.
+Selection is **capability-based over whatever the endpoint reports** — there
+are deliberately no hardcoded model ids, so the tool works on any machine with
+any set of installed models. Each class applies hard filters (model type,
+`tool_use` capability when required, fits the memory budget), then a size
+preference (reflex prefers the smallest viable, heavy the largest admissible,
+workhorse the largest under ~40% of budget), then weak pattern-based family
+hints to break ties. Classes fall back to a smaller general-purpose class when
+nothing fits, and return a clear "no model fits this class" error rather than
+a silent wrong answer when nothing works at all. Override any class with
+`~/.config/local-llm/classes.json`, e.g. `{"workhorse": ["my-model"]}`.
+
+The `security` class contains abliterated or uncensored models (detected by
+pattern among your own installed models) and is never auto-selected. It
+requires an explicit `--class security` or `--uncensored`. These models trade
+instruction-following and factual accuracy for the absence of refusals. They
+are a remedy for false refusals on systems you own or are authorised to test,
+not a general-purpose model choice.
+
+## Privacy
+
+`local-llm` reads your local files (the input JSONL, templates, and its own
+config and state under `~/.config/local-llm` and `~/.local/state/local-llm`).
+It sends prompts only to the endpoint you configure — by default the LM
+Studio server on `127.0.0.1` — and makes no other network calls. It never
+transmits credentials.
 
 ## Tests
 

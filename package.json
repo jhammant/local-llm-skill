@@ -1,14 +1,38 @@
 {
-  "name": "local-llm",
+  "name": "local-llm-skill",
   "version": "1.0.0",
   "description": "A memory-aware batch inference worker for LM Studio",
   "type": "module",
   "bin": {
     "local-llm": "src/cli.mjs"
   },
+  "files": [
+    "src",
+    "data",
+    "skill",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "check:publishable": "! grep -rn '/Use[r]s/' --exclude-dir=.git --exclude-dir=node_modules --exclude='*.md' ."
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jhammant/local-llm-skill.git"
+  },
+  "bugs": "https://github.com/jhammant/local-llm-skill/issues",
+  "homepage": "https://github.com/jhammant/local-llm-skill#readme",
+  "keywords": [
+    "lm-studio",
+    "local-llm",
+    "batch",
+    "inference",
+    "mlx",
+    "gguf",
+    "claude-code",
+    "skill"
+  ],
   "engines": {
     "node": ">=18"
   },

@@ -20,6 +20,8 @@ import {
   runBatch,
   substituteTemplate,
 } from './batch.mjs';
+import { planBatch } from './plan.mjs';
+import { recordThroughput, runBench } from './bench.mjs';
 
 const VERSION = '1.0.0';
 const VALUE_OPTIONS = new Set([
@@ -55,6 +57,9 @@ Usage:
   local-llm batch <items.jsonl> (--template f | --prompt s) [--out f]
       [--class c] [--model m] [--field name] [--system f]
       [--concurrency n] [--allow a,b,c] [--restart] [--dry-run] [--json]
+  local-llm plan <items.jsonl> (--template f | --prompt s)
+      [--class c] [--model m] [--field name] [--json]
+  local-llm bench [--model m] [--class c] [--json]
   local-llm load <model> [--dry-run] [--json]
   local-llm unload <identifier | --all> [--json]
   local-llm pin <model> | unpin <model> | pins [--json]
@@ -337,6 +342,64 @@ async function batchCommand(endpoint, options, inputFiles) {
   return 0;
 }
 
+function formatSeconds(seconds) {
+  if (seconds == null || !Number.isFinite(seconds)) return '?';
+  const total = Math.max(0, Math.round(seconds));
+  const hours = Math.floor(total / 3_600);
+  const minutes = Math.floor((total % 3_600) / 60);
+  if (hours > 0) return `~${hours}h ${minutes}m`;
+  if (minutes > 0) return `~${minutes}m ${total % 60}s`;
+  return `~${total}s`;
+}
+
+async function planCommand(endpoint, options, args) {
+  if (args.length !== 1) throw new Error('plan requires exactly one input file');
+  if (Boolean(options.template) === Boolean(options.prompt)) {
+    throw new Error('plan requires exactly one of --template <file> or --prompt <text>');
+  }
+  const template = options.template
+    ? await readFile(options.template, 'utf8')
+    : options.prompt;
+  const items = await readItems(args[0], { field: options.field });
+  const model = await resolveBatchModel(endpoint, options);
+  const plan = await planBatch({ endpoint, model, template, items });
+
+  if (options.json) {
+    writeJson(plan);
+    return;
+  }
+  process.stdout.write(
+    [
+      `Plan for ${plan.items} item(s) with ${plan.model} on endpoint "${plan.endpoint}"`,
+      `  prompt tokens/item:  ${plan.sample.promptTokensPerItem.toFixed(0)} (${plan.sample.source}; sampled ${plan.sample.sampled} items)`,
+      `  completion/item:     ${plan.completionTokensPerItem.value} (${plan.completionTokensPerItem.source})`,
+      `  aggregate rate:      ${plan.rate.tokPerSec.toFixed(1)} tok/s (${plan.rate.source})`,
+      `  total tokens:        ~${Math.round(plan.totalTokens).toLocaleString('en-US')}`,
+      `  ETA:                 ${formatSeconds(plan.etaSeconds)}`,
+    ].join('\n') + '\n',
+  );
+}
+
+async function benchCommand(endpoint, options) {
+  const model = await resolveBatchModel(endpoint, options);
+  const result = await runBench({ endpoint, model });
+  const cachePath = await recordThroughput(result);
+
+  if (options.json) {
+    writeJson({ ...result, throughputPath: cachePath });
+    return;
+  }
+  process.stdout.write(
+    [
+      `Bench of ${result.model} on endpoint "${result.endpoint}"`,
+      `  model load:          ${result.loadSeconds.toFixed(1)} s`,
+      `  single stream:       ${result.singleTokPerSec.toFixed(1)} tok/s (measured)`,
+      `  ${result.concurrency}-way aggregate:  ${result.aggregateTokPerSec.toFixed(1)} tok/s (measured)`,
+      `  recorded to ${cachePath}`,
+    ].join('\n') + '\n',
+  );
+}
+
 async function loadCommand(endpoint, options, args) {
   if (args.length !== 1) throw new Error('load requires exactly one model id');
   const plan = await admit(endpoint, args[0], { dryRun: Boolean(options.dryRun) });
@@ -410,6 +473,13 @@ export async function main(argv = process.argv.slice(2)) {
       return 0;
     case 'batch':
       return batchCommand(endpoint, options, args);
+    case 'plan':
+      await planCommand(endpoint, options, args);
+      return 0;
+    case 'bench':
+      if (args.length > 0) throw new Error('bench takes no positional arguments');
+      await benchCommand(endpoint, options);
+      return 0;
     case 'load':
       await loadCommand(endpoint, options, args);
       return 0;
