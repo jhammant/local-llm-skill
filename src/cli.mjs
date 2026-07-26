@@ -35,6 +35,7 @@ const VALUE_OPTIONS = new Set([
   'system',
   'concurrency',
   'allow',
+  'sample',
 ]);
 const BOOLEAN_OPTIONS = new Set([
   'json',
@@ -43,6 +44,7 @@ const BOOLEAN_OPTIONS = new Set([
   'restart',
   'dry-run',
   'all',
+  'no-sample',
   'help',
   'version',
 ]);
@@ -58,7 +60,8 @@ Usage:
       [--class c] [--model m] [--field name] [--system f]
       [--concurrency n] [--allow a,b,c] [--restart] [--dry-run] [--json]
   local-llm plan <items.jsonl> (--template f | --prompt s)
-      [--class c] [--model m] [--field name] [--json]
+      [--class c] [--model m] [--field name] [--allow a,b,c]
+      [--sample n] [--no-sample] [--json]
   local-llm bench [--model m] [--class c] [--json]
   local-llm load <model> [--dry-run] [--json]
   local-llm unload <identifier | --all> [--json]
@@ -357,12 +360,29 @@ async function planCommand(endpoint, options, args) {
   if (Boolean(options.template) === Boolean(options.prompt)) {
     throw new Error('plan requires exactly one of --template <file> or --prompt <text>');
   }
+  let probeSampleSize;
+  if (options.sample != null) {
+    probeSampleSize = Number(options.sample);
+    if (!Number.isInteger(probeSampleSize) || probeSampleSize <= 0) {
+      throw new Error(`--sample requires a positive integer; received "${options.sample}"`);
+    }
+  }
   const template = options.template
     ? await readFile(options.template, 'utf8')
     : options.prompt;
   const items = await readItems(args[0], { field: options.field });
   const model = await resolveBatchModel(endpoint, options);
-  const plan = await planBatch({ endpoint, model, template, items });
+  const plan = await planBatch({
+    endpoint,
+    model,
+    template,
+    items,
+    allowed: options.allow
+      ? String(options.allow).split(',').map((v) => v.trim()).filter(Boolean)
+      : null,
+    probe: !options.noSample,
+    ...(probeSampleSize == null ? {} : { probeSampleSize }),
+  });
 
   if (options.json) {
     writeJson(plan);

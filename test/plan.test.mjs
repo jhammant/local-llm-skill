@@ -91,6 +91,7 @@ test('planBatch labels an unmeasured rate as assumed', async (t) => {
     template: 'Say: {{text}}',
     items: Array.from({ length: 40 }, () => ({ text: 'some input text' })),
     throughputPath: join(directory, 'throughput.json'),
+    probe: false,
   });
   assert.equal(plan.items, 40);
   assert.equal(plan.rate.measured, false);
@@ -119,6 +120,7 @@ test('planBatch uses a measured rate from the throughput cache', async (t) => {
     template: '{{text}}',
     items,
     throughputPath,
+    probe: false,
   });
   assert.equal(plan.rate.measured, true);
   assert.equal(plan.rate.tokPerSec, 86.8);
@@ -126,4 +128,100 @@ test('planBatch uses a measured rate from the throughput cache', async (t) => {
   // 1 prompt token + 300 assumed completion tokens per item, 40 items.
   const expected = (40 * (1 + 300)) / 86.8;
   assert.ok(Math.abs(plan.etaSeconds - expected) < 1e-6);
+});
+
+test('planBatch probes the model: a 3-token completion shrinks the estimate ~100x', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'local-llm-plan-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const throughputPath = join(directory, 'throughput.json');
+
+  let calls = 0;
+  const fakeClient = {
+    async chat(_endpoint, { messages }) {
+      calls += 1;
+      assert.equal(messages.at(-1).role, 'user');
+      return { message: { content: 'yes' }, usage: { completion_tokens: 3 } };
+    },
+  };
+  const items = Array.from({ length: 40 }, () => ({ text: 'aaaa' }));
+  const base = {
+    endpoint,
+    model: 'never-benched-model',
+    template: '{{text}}',
+    items,
+    throughputPath,
+  };
+
+  const measuredPlan = await planBatch({ ...base, client: fakeClient });
+  assert.equal(calls, 3, 'default probe samples 3 items');
+  assert.equal(measuredPlan.completionTokensPerItem.value, 3);
+  assert.match(measuredPlan.completionTokensPerItem.source, /measured \(n=3 sample\)/);
+
+  const assumedPlan = await planBatch({ ...base, probe: false });
+  assert.equal(assumedPlan.completionTokensPerItem.value, 300);
+  assert.match(assumedPlan.completionTokensPerItem.source, /assumed/);
+
+  // 301 vs 4 tokens/item is 75x here; with any non-trivial prompt it trends
+  // to the full 100x of 300 vs 3. "Roughly 100x smaller" is the claim.
+  const ratio = assumedPlan.totalTokens / measuredPlan.totalTokens;
+  assert.ok(ratio > 50, `expected ~100x smaller estimate, got ${ratio}x`);
+});
+
+test('planBatch probe honours --allow via the constrained-output path', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'local-llm-plan-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+
+  const calls = [];
+  const fakeClient = {
+    async chat(_endpoint, { messages }) {
+      calls.push(messages);
+      const constrained = messages.at(-1).content.includes('permitted answers');
+      // Out-of-set answers ramble (50 tokens); the constrained retry is one word.
+      return constrained
+        ? { message: { content: 'yes' }, usage: { completion_tokens: 3 } }
+        : { message: { content: 'maybe, perhaps, unclear' }, usage: { completion_tokens: 50 } };
+    },
+  };
+
+  const plan = await planBatch({
+    endpoint,
+    model: 'never-benched-model',
+    template: '{{text}}',
+    items: Array.from({ length: 40 }, () => ({ text: 'aaaa' })),
+    throughputPath: join(directory, 'throughput.json'),
+    allowed: ['yes', 'no'],
+    client: fakeClient,
+  });
+
+  assert.equal(calls.length, 6, 'each of the 3 probes needed one constrained retry');
+  assert.ok(
+    calls.filter((messages) => messages.at(-1).content.includes('permitted answers')).length === 3,
+    'the probe must restate the constraint exactly like batch does',
+  );
+  assert.equal(plan.completionTokensPerItem.value, 3);
+  assert.match(plan.completionTokensPerItem.source, /measured \(n=3 sample\)/);
+});
+
+test('planBatch falls back to the assumed default when the probe fails', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'local-llm-plan-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+
+  const failingClient = {
+    async chat() {
+      throw new Error('model not loaded');
+    },
+  };
+  const plan = await planBatch({
+    endpoint,
+    model: 'never-benched-model',
+    template: '{{text}}',
+    items: Array.from({ length: 40 }, () => ({ text: 'aaaa' })),
+    throughputPath: join(directory, 'throughput.json'),
+    client: failingClient,
+  });
+
+  assert.equal(plan.completionTokensPerItem.value, 300);
+  assert.match(plan.completionTokensPerItem.source, /assumed default/);
+  assert.match(plan.completionTokensPerItem.source, /probe failed: model not loaded/);
+  assert.ok(plan.etaSeconds > 0);
 });

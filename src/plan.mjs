@@ -7,9 +7,11 @@
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { ITEM_LINE, substituteTemplate } from './batch.mjs';
+import { ITEM_LINE, normalizeAnswer, substituteTemplate } from './batch.mjs';
+import * as lmstudio from './lmstudio.mjs';
 
 export const SAMPLE_SIZE = 20;
+export const PROBE_SAMPLE_SIZE = 3;
 export const ASSUMED_COMPLETION_TOKENS = 300;
 export const ASSUMED_TOK_PER_SEC = 30;
 
@@ -128,13 +130,89 @@ export function rateForModel(throughput, endpointId, model) {
   };
 }
 
+function probeCompletionTokens(usage) {
+  const value = usage?.completion_tokens ?? usage?.output_tokens;
+  const tokens = Number(value);
+  if (!Number.isFinite(tokens) || tokens < 0) {
+    throw new Error('chat response did not report completion tokens');
+  }
+  return tokens;
+}
+
+// One probe request, mirroring runBatch's request shape exactly: same system
+// message, same rendered user prompt, and — when `allowed` is set — the same
+// constrained-output repair (show the model its out-of-set answer, restate
+// the constraint, retry). The measured completion length only reflects
+// reality if the probe walks the same path the batch will.
+async function probeChat(client, endpoint, model, messages, allowed) {
+  const allowedSet = Array.isArray(allowed) && allowed.length > 0;
+  let lastRaw = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const attemptMessages = [...messages];
+    if (lastRaw != null && allowedSet) {
+      attemptMessages.push({ role: 'assistant', content: lastRaw });
+      attemptMessages.push({
+        role: 'user',
+        content:
+          'That is not one of the permitted answers. Reply with exactly one of: '
+          + `${allowed.join(', ')}. Output only that word, nothing else.`,
+      });
+    }
+    const result = await client.chat(endpoint, { model, messages: attemptMessages });
+    const raw = result.message?.content ?? result.message;
+    if (!allowedSet || normalizeAnswer(raw, allowed) != null) return result;
+    lastRaw = raw;
+  }
+  throw new Error('probe response was not in the allowed set');
+}
+
+// Measure the real completion length instead of assuming it. A small sample
+// of the ACTUAL rendered prompts goes to the model and the mean of the API's
+// completion_tokens is the estimate. This exists because the old 300-token
+// assumption dominated short-output jobs: on a 3,803-item one-word
+// classification job it predicted ~16h against ~25m actual (38x over).
+// Returns null when there is nothing to sample; throws on probe failure so
+// the caller can fall back to the stated assumption.
+export async function measureCompletionTokens({
+  endpoint,
+  model,
+  template,
+  items,
+  system,
+  allowed = null,
+  sampleSize = PROBE_SAMPLE_SIZE,
+  client = lmstudio,
+} = {}) {
+  const sample = sampleItems(items, sampleSize);
+  if (sample.length === 0) return null;
+  let total = 0;
+  for (const item of sample) {
+    const prompt = substituteTemplate(template, item, item?.[ITEM_LINE] ?? '?');
+    const messages = [
+      ...(system == null ? [] : [{ role: 'system', content: system }]),
+      { role: 'user', content: prompt },
+    ];
+    const result = await probeChat(client, endpoint, model, messages, allowed);
+    total += probeCompletionTokens(result.usage);
+  }
+  return {
+    sampled: sample.length,
+    completionTokensPerItem: Math.round((total / sample.length) * 10) / 10,
+  };
+}
+
 export async function planBatch({
   endpoint,
   model,
   template,
   items,
   sampleSize = SAMPLE_SIZE,
-  completionTokensPerItem = ASSUMED_COMPLETION_TOKENS,
+  completionTokensPerItem = null,
+  probe = true,
+  probeSampleSize = PROBE_SAMPLE_SIZE,
+  system,
+  allowed = null,
+  client = lmstudio,
   ...options
 } = {}) {
   if (!endpoint || typeof endpoint !== 'object' || typeof endpoint.id !== 'string') {
@@ -149,8 +227,42 @@ export async function planBatch({
   const throughput = await readThroughput(options);
   const rate = rateForModel(throughput, endpoint.id, model);
 
+  // Completion length: an explicit override, else a live probe of the model,
+  // else the stated 300-token assumption. A failed probe must never crash the
+  // plan — fall back to the assumption and say so in the label.
+  let completion;
+  if (completionTokensPerItem != null) {
+    completion = { value: completionTokensPerItem, source: 'assumed default' };
+  } else if (!probe) {
+    completion = { value: ASSUMED_COMPLETION_TOKENS, source: 'assumed default' };
+  } else {
+    try {
+      const measured = await measureCompletionTokens({
+        endpoint,
+        model,
+        template,
+        items,
+        system,
+        allowed,
+        sampleSize: probeSampleSize,
+        client,
+      });
+      completion = measured == null
+        ? { value: ASSUMED_COMPLETION_TOKENS, source: 'assumed default' }
+        : {
+          value: measured.completionTokensPerItem,
+          source: `measured (n=${measured.sampled} sample)`,
+        };
+    } catch (error) {
+      completion = {
+        value: ASSUMED_COMPLETION_TOKENS,
+        source: `assumed default (probe failed: ${error.message})`,
+      };
+    }
+  }
+
   const itemCount = items.length;
-  const tokensPerItem = prompt.promptTokensPerItem + completionTokensPerItem;
+  const tokensPerItem = prompt.promptTokensPerItem + completion.value;
   const totalTokens = tokensPerItem * itemCount;
   const etaSeconds = rate.tokPerSec > 0 ? totalTokens / rate.tokPerSec : null;
 
@@ -159,10 +271,7 @@ export async function planBatch({
     model,
     items: itemCount,
     sample: prompt,
-    completionTokensPerItem: {
-      value: completionTokensPerItem,
-      source: 'assumed default',
-    },
+    completionTokensPerItem: completion,
     rate,
     tokensPerItem,
     totalTokens,
