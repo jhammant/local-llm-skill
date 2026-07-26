@@ -12,6 +12,7 @@ export async function ask({
   tools,
   temperature,
   maxTokens,
+  reasoningEffort,
   signal,
   client = lmstudio,
   selectModelFn = selectModel,
@@ -65,6 +66,7 @@ export async function ask({
     tools,
     temperature,
     maxTokens,
+    reasoningEffort,
     signal,
   });
   await touchFn(endpoint, lruIdentifier, touchOptions);

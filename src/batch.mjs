@@ -290,6 +290,7 @@ export async function runBatch({
   items,
   out,
   concurrency,
+  reasoningEffort,
   restart = false,
   onProgress,
   signal,
@@ -426,7 +427,7 @@ export async function runBatch({
               `${allowed.join(', ')}. Output only that word, nothing else.`,
           });
         }
-        const result = await client.chat(endpoint, { model, messages });
+        const result = await client.chat(endpoint, { model, messages, reasoningEffort });
         const raw = outputText(result.message);
 
         if (allowedSet) {

@@ -36,6 +36,7 @@ const VALUE_OPTIONS = new Set([
   'concurrency',
   'allow',
   'sample',
+  'reasoning-effort',
 ]);
 const BOOLEAN_OPTIONS = new Set([
   'json',
@@ -55,13 +56,15 @@ Usage:
   local-llm models [--fit] [--class <c>] [--json]
   local-llm ps [--json]
   local-llm budget [--json]
-  local-llm ask <prompt…> [--class c] [--model m] [--uncensored] [--json]
+  local-llm ask <prompt…> [--class c] [--model m] [--uncensored]
+      [--reasoning-effort e] [--json]
   local-llm batch <items.jsonl> (--template f | --prompt s) [--out f]
       [--class c] [--model m] [--field name] [--system f]
-      [--concurrency n] [--allow a,b,c] [--restart] [--dry-run] [--json]
+      [--concurrency n] [--allow a,b,c] [--reasoning-effort e]
+      [--restart] [--dry-run] [--json]
   local-llm plan <items.jsonl> (--template f | --prompt s)
       [--class c] [--model m] [--field name] [--allow a,b,c]
-      [--sample n] [--no-sample] [--json]
+      [--reasoning-effort e] [--sample n] [--no-sample] [--json]
   local-llm bench [--model m] [--class c] [--json]
   local-llm load <model> [--dry-run] [--json]
   local-llm unload <identifier | --all> [--json]
@@ -70,6 +73,8 @@ Usage:
 
 Global:
   --endpoint <id>   endpoint registry id (default: configured local endpoint)
+  --reasoning-effort <none|low|medium|high>   opt-in; omitted from the request
+                    when unset, for thinking models on ask/batch/plan
 `;
 
 function optionName(name) {
@@ -235,6 +240,7 @@ async function askCommand(endpoint, options, promptParts) {
     class: options.class,
     model: options.model,
     uncensored: options.uncensored,
+    reasoningEffort: options.reasoningEffort,
   });
   if (options.json) writeJson(result);
   else process.stdout.write(`${result.response ?? ''}\n`);
@@ -313,6 +319,7 @@ async function batchCommand(endpoint, options, inputFiles) {
       items,
       out,
       concurrency: options.concurrency,
+      reasoningEffort: options.reasoningEffort,
       allowed: options.allow
         ? String(options.allow).split(',').map((v) => v.trim()).filter(Boolean)
         : null,
@@ -380,6 +387,7 @@ async function planCommand(endpoint, options, args) {
     allowed: options.allow
       ? String(options.allow).split(',').map((v) => v.trim()).filter(Boolean)
       : null,
+    reasoningEffort: options.reasoningEffort,
     probe: !options.noSample,
     ...(probeSampleSize == null ? {} : { probeSampleSize }),
   });
@@ -463,6 +471,9 @@ async function pinsCommand(endpoint, options, command, args) {
 
 export async function main(argv = process.argv.slice(2)) {
   const { options, positionals } = parseArgs(argv);
+  if (options.reasoningEffort != null) {
+    options.reasoningEffort = lmstudio.validateReasoningEffort(options.reasoningEffort);
+  }
   if (options.version) {
     if (options.json) writeJson({ version: VERSION });
     else process.stdout.write(`${VERSION}\n`);

@@ -140,11 +140,12 @@ function probeCompletionTokens(usage) {
 }
 
 // One probe request, mirroring runBatch's request shape exactly: same system
-// message, same rendered user prompt, and — when `allowed` is set — the same
-// constrained-output repair (show the model its out-of-set answer, restate
-// the constraint, retry). The measured completion length only reflects
-// reality if the probe walks the same path the batch will.
-async function probeChat(client, endpoint, model, messages, allowed) {
+// message, same rendered user prompt, same reasoning effort (a thinking model
+// can emit ~190x the completion tokens without it), and — when `allowed` is
+// set — the same constrained-output repair (show the model its out-of-set
+// answer, restate the constraint, retry). The measured completion length only
+// reflects reality if the probe walks the same path the batch will.
+async function probeChat(client, endpoint, model, messages, allowed, reasoningEffort) {
   const allowedSet = Array.isArray(allowed) && allowed.length > 0;
   let lastRaw = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -158,7 +159,7 @@ async function probeChat(client, endpoint, model, messages, allowed) {
           + `${allowed.join(', ')}. Output only that word, nothing else.`,
       });
     }
-    const result = await client.chat(endpoint, { model, messages: attemptMessages });
+    const result = await client.chat(endpoint, { model, messages: attemptMessages, reasoningEffort });
     const raw = result.message?.content ?? result.message;
     if (!allowedSet || normalizeAnswer(raw, allowed) != null) return result;
     lastRaw = raw;
@@ -180,6 +181,7 @@ export async function measureCompletionTokens({
   items,
   system,
   allowed = null,
+  reasoningEffort,
   sampleSize = PROBE_SAMPLE_SIZE,
   client = lmstudio,
 } = {}) {
@@ -192,7 +194,7 @@ export async function measureCompletionTokens({
       ...(system == null ? [] : [{ role: 'system', content: system }]),
       { role: 'user', content: prompt },
     ];
-    const result = await probeChat(client, endpoint, model, messages, allowed);
+    const result = await probeChat(client, endpoint, model, messages, allowed, reasoningEffort);
     total += probeCompletionTokens(result.usage);
   }
   return {
@@ -212,6 +214,7 @@ export async function planBatch({
   probeSampleSize = PROBE_SAMPLE_SIZE,
   system,
   allowed = null,
+  reasoningEffort,
   client = lmstudio,
   ...options
 } = {}) {
@@ -244,6 +247,7 @@ export async function planBatch({
         items,
         system,
         allowed,
+        reasoningEffort,
         sampleSize: probeSampleSize,
         client,
       });

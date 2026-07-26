@@ -23,19 +23,29 @@ aggregate throughput as single-stream rate × slot count; it overstates by ~3×.
 The eval set is the 88 items (of 3,803) that defeated a naive single-word
 prompt — a deliberately pessimistic set, not representative of general accuracy.
 
-| config | in-set | completion tok/item | s/item | 88 items |
+| config | in-set | agrees w/ thinking ref | tok/item | 88 items |
 |---|---|---|---|---|
-| `laguna-s-2.1` + thinking (default) | **88/88 (100%)** | 482 | 59.8 | 88 min |
-| `laguna-s-2.1` + `reasoning_effort=none` | 79/88 (89.8%) | 2.5 | **0.61** | 54 s |
-| `qwen3-coder-next` | 86/88 (97.7%) | 2 | 1.4 | ~2 min |
+| `laguna-s-2.1` + thinking (default) | 88/88 | 100% (reference) | 482 | 88 min |
+| **`laguna-s-2.1` + `reasoning_effort=none` + `--allow`** | **88/88** | **76%** | 2.5 | **47 s** |
+| `laguna-s-2.1` + `reasoning_effort=none`, no retry | 79/88 | — | 2.5 | 54 s |
+| `qwen3-coder-next` + `--allow` | 86/88 | 48% | 2.4 | ~2 min |
 
-**The thinking is the capability.** Disabling it costs Laguna 10 points of
-accuracy and drops it *below* qwen, while buying only ~2× speed over qwen.
-There is no configuration where Laguna is both more accurate and faster.
+**The corrective retry is what makes no-thinking viable.** Measured without
+`--allow`, disabling thinking costs 10 points of in-set coverage (79/88) and
+looks strictly worse than qwen. With `--allow` re-asking the drifted items, the
+same configuration reaches **88/88 in 47 seconds** — 112× faster than thinking
+mode for the same coverage, and closer to the considered answer than qwen is.
 
-**Routing conclusion:** `qwen3-coder-next` is the default for bulk
-classification. `laguna-s-2.1` with thinking is for the hard tail where 100%
-justifies 43× latency. The two models agreed on only 48% of these hard items.
+An earlier reading of this table concluded "the thinking is the capability, use
+qwen for bulk". That was wrong: it compared a no-retry run against retry-enabled
+runs. Constrained decoding plus one corrective re-ask recovers most of what
+disabling thinking costs.
+
+**Routing conclusion:** `laguna-s-2.1` with `reasoning_effort=none` and
+`--allow` is the default for bulk constrained-output work. Reserve thinking mode
+for small hard sets where the considered answer is worth 112× the latency.
+Note "agreement with thinking mode" is a proxy, not ground truth — thinking mode
+is the most-deliberated answer, not a verified-correct one.
 
 ## Reasoning-effort control (thinking models)
 

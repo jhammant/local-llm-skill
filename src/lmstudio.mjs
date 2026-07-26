@@ -281,9 +281,22 @@ export async function unload(endpoint, identifier, options = {}) {
   return { identifier };
 }
 
+export const REASONING_EFFORTS = ['none', 'low', 'medium', 'high'];
+
+// Opt-in only: the field is omitted entirely when unset, because servers
+// fronting non-thinking models may reject an unknown reasoning_effort value.
+export function validateReasoningEffort(value) {
+  if (!REASONING_EFFORTS.includes(value)) {
+    throw new Error(
+      `Invalid reasoning effort "${value}". Valid options: ${REASONING_EFFORTS.join(', ')}`,
+    );
+  }
+  return value;
+}
+
 export async function chat(
   endpoint,
-  { model, messages, tools, temperature, maxTokens, signal },
+  { model, messages, tools, temperature, maxTokens, reasoningEffort, signal },
   options = {},
 ) {
   const started = performance.now();
@@ -294,6 +307,7 @@ export async function chat(
     ...(tools == null ? {} : { tools }),
     ...(temperature == null ? {} : { temperature }),
     ...(maxTokens == null ? {} : { max_tokens: maxTokens }),
+    ...(reasoningEffort == null ? {} : { reasoning_effort: validateReasoningEffort(reasoningEffort) }),
   };
   const response = await requestJson(endpoint, '/v1/chat/completions', {
     method: 'POST',
