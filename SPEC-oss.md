@@ -1,7 +1,7 @@
 # Making `local-llm` publishable — phase 1.5 spec
 
 Apply **after** the v1 core (SPEC.md) lands. The v1 build is allowed to be
-Mac-and-Jon-shaped; this pass makes it correct for a stranger with a different
+shaped around one machine; this pass makes it correct for a stranger with a different
 machine and a different set of models.
 
 Target: publish as **`local-llm-skill`** — verified free on both npm and GitHub,

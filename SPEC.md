@@ -113,7 +113,7 @@ Algorithm:
   touched on every successful request.
 - **Pinning**: `~/.config/local-llm/pins.json` — a list of model ids that must
   never be auto-evicted. `pin`/`unpin` commands manage it.
-- The user has granted full autonomy to evict; pins are the only exception.
+- Eviction is autonomous by default; pins are the only exception.
 - `dryRun` must return the identical plan without mutating anything — the tests
   depend on this and `--dry-run` on the CLI exposes it.
 
