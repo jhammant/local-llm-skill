@@ -1,14 +1,39 @@
 # local-llm
 
-`local-llm` turns LM Studio into a memory-aware batch-inference worker. It can
-select a model for a job, keep loaded models inside a safe unified-memory
-budget, evict the least-recently-used unpinned model when necessary, and resume
-long JSONL jobs after interruption.
+**A 100 GB model and a 3 GB model do not co-reside on a 128 GB machine.** Run bulk
+work through LM Studio and you spend your time babysitting memory instead of doing
+the work: guessing what fits, watching a load fail three-quarters of the way in,
+losing an overnight job to a crash at item 3,000, and discovering afterwards that
+the model quietly answered in its own categories instead of yours.
 
-It requires Node.js 18 or newer and has no runtime dependencies. LM Studio's
-server should be running, and CLI-controlled endpoints need the `lms` binary.
-The binary is resolved from `LMS_BIN`, `which lms`, or
-`~/.lmstudio/bin/lms`, in that order.
+`local-llm` takes that over. It picks a model that fits the budget, evicts what it
+must, resumes a batch exactly where it stopped, and constrains the output to a set
+you specify — re-asking the model when it drifts.
+
+```text
+$ local-llm batch commits.jsonl --template classify.md --out out.jsonl \
+    --allow feature,bugfix,refactor,docs,test,infra,release
+3803/3803  ok 3803  failed 0  ETA 0s
+Batch complete: 3803/3803, 3803 ok, 0 failed. Output: out.jsonl
+```
+
+```mermaid
+flowchart LR
+  A[items.jsonl] --> B[plan<br/>time a real sample]
+  B --> C{admission<br/>control}
+  C -->|fits| D[load]
+  C -->|too big| E[evict LRU<br/>never pinned]
+  E --> D
+  D --> F[batch runner<br/>resumable]
+  F --> G{answer in<br/>allowed set?}
+  G -->|yes| H[out.jsonl]
+  G -->|no| I[re-ask with<br/>the constraint]
+  I --> G
+```
+
+It runs on Node 18+ with **no runtime dependencies**, needs LM Studio's server
+running, and resolves the `lms` binary from `LMS_BIN`, `which lms`, or
+`~/.lmstudio/bin/lms` in that order.
 
 ## Install
 
