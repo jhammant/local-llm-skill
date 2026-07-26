@@ -81,3 +81,29 @@ an **empty string** while still billing 512 tokens — a trap worth knowing.
   MLX build fails with `Model type laguna not supported` regardless of
   quantization. GGUF via llama.cpp works. Test architecture support with the
   smallest available sibling before downloading a large model.
+
+## Prefill vs decode (why estimating from tok/s fails)
+
+Measured on `laguna-s-2.1`, `reasoning_effort=none`:
+
+| | rate |
+|---|---|
+| prefill (prompt processing) | **388.4 tok/s** |
+| decode (generation) | **56.0 tok/s** |
+
+A **7× difference**. Charging both at one rate — as a naive estimator does —
+overstates any job whose prompts dominate its completions.
+
+But separating them is still not enough. Against a 34-minute ground truth:
+
+| estimator | predicted | error |
+|---|---|---|
+| single aggregate tok/s | 1h 44m | 3× over |
+| bench `itemsPerSec` (measured on another task) | 2h 58m | 5× over |
+| separate prefill/decode rates | ~7 min | 5× under |
+| **8-item end-to-end sample of the real job** | **36m 43s** | **8%** |
+
+Short requests are dominated by fixed per-request overhead that no token
+throughput figure captures. `local-llm plan` therefore times a real sample
+through the real code path — including constrained-output retries, which are
+part of the real cost — rather than extrapolating from rates.
