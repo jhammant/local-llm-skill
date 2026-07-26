@@ -84,6 +84,28 @@ test('an empty catalog fails with a clear message, not a crash', async () => {
   );
 });
 
+test('a backend with toolInfo:false does not hard-filter on tool_use and says so in why', async () => {
+  // A generic OpenAI-compatible server cannot report capabilities. That must
+  // not exclude every model from tool-requiring classes — absence of
+  // information is not denial.
+  const client = {
+    capabilities: Object.freeze({
+      sizes: false, loadedState: false, load: false, unload: false,
+      embed: false, toolInfo: false,
+    }),
+    async listModels() {
+      return [
+        { id: 'some/chat-model', type: 'llm', capabilities: [], sizeGb: null },
+        { id: 'other/coder-model', type: 'llm', capabilities: [], sizeGb: null },
+      ];
+    },
+  };
+  const selected = await selectModel({ class: 'coder', endpoint, client });
+  assert.equal(selected.id, 'other/coder-model');
+  assert.equal(selected.class, 'coder', 'no fall-through to a lesser class');
+  assert.match(selected.why, /tool support unverified \(backend does not report capabilities\)/);
+});
+
 test('security models are never selected unless security is explicit', async () => {
   const security = {
     id: 'qwen3.6-35b-a3b-abliterated-heretic-mlx',

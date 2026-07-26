@@ -11,7 +11,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import * as lmstudio from './lmstudio.mjs';
+import { resolve } from './providers/index.mjs';
 import { admit } from './ration.mjs';
 
 const OVERRIDES = path.join(os.homedir(), '.config', 'local-llm', 'classes.json');
@@ -33,12 +33,17 @@ const UNCENSORED = /abliterat|uncensor|heretic|dolphin/i;
 
 // `size` picks how to order admissible candidates:
 //   'smallest' — cheapest that can do the job (throughput matters most)
-//   'largest'  — most capable that fits
-//   'balanced' — biggest model under `cap` × budget, else smallest available
+//   'largest'  — most capable that fits; admission handles eviction
+//   'balanced' — prefers models under `cap` x budget, and among those the
+//                SMALLER one. Right for high-volume classes where a cheaper
+//                model run thousands of times beats a better one run slowly.
+// Single-shot classes that want the most capable model use 'largest', not
+// 'balanced' — on a catalog holding both a 7b and a 32b coder, 'balanced'
+// would pick the 7b.
 export const JOB_CLASSES = Object.freeze({
   reflex: { type: 'text', size: 'smallest', hint: null },
   workhorse: { type: 'text', size: 'balanced', cap: 0.4, hint: HINTS.instruct },
-  coder: { type: 'text', size: 'balanced', cap: 0.75, hint: HINTS.coder, tools: true },
+  coder: { type: 'text', size: 'largest', hint: HINTS.coder, tools: true },
   heavy: { type: 'text', size: 'largest', hint: HINTS.reasoning },
   vision: { type: 'vlm', size: 'balanced', cap: 0.4, hint: HINTS.vision },
   embed: { type: 'embeddings', size: 'smallest', hint: HINTS.embed },
@@ -107,7 +112,7 @@ export async function selectModel({
   class: requestedClass = 'workhorse',
   endpoint,
   requireTools = false,
-  client = lmstudio,
+  client = null,
   admitFn = admit,
   admissionOptions = {},
   budgetGb = null,
@@ -121,9 +126,22 @@ export async function selectModel({
     );
   }
 
-  const models = await client.listModels(endpoint);
+  const provider = client ?? resolve(endpoint);
+  const models = await provider.listModels(endpoint);
   const overrides = readOverrides();
   const rejected = [];
+
+  // Backends that cannot report sizes (and catalogs where every size is
+  // unknown) get no size band and no admission filter — a missing size must
+  // never sort as zero, which would make an unknown model look smallest.
+  const sizesAvailable = provider.capabilities?.sizes !== false
+    && models.some((model) => Number.isFinite(model?.sizeGb));
+
+  // Same principle for tool_use: a backend that cannot report capabilities
+  // (toolInfo: false) must not hard-filter on them, and neither may a model
+  // whose capabilities are unknown (null, e.g. a failed lookup). Absence of
+  // information is not denial — only a KNOWN-empty capability list excludes.
+  const toolInfoAvailable = provider.capabilities?.toolInfo !== false;
 
   for (const candidateClass of FALLBACKS[requestedClass]) {
     const spec = JOB_CLASSES[candidateClass];
@@ -147,11 +165,16 @@ export async function selectModel({
 
     for (const { model } of ordered) {
       const needTools = requireTools || spec.tools === true;
-      if (needTools && !model.capabilities?.includes('tool_use')) {
+      if (needTools && toolInfoAvailable
+          && Array.isArray(model.capabilities)
+          && !model.capabilities.includes('tool_use')) {
         rejected.push(`${model.id}: no tool_use`);
         continue;
       }
-      const plan = await admitFn(endpoint, model.id, { ...admissionOptions, client, dryRun: true });
+      // Without size information there is no admission filter to apply.
+      const plan = sizesAvailable
+        ? await admitFn(endpoint, model.id, { ...admissionOptions, client: provider, dryRun: true })
+        : { ok: true, action: 'unmanaged', evicted: [], reason: 'backend does not report sizes' };
       if (!plan.ok) {
         rejected.push(`${model.id}: ${plan.reason}`);
         continue;
@@ -167,7 +190,11 @@ export async function selectModel({
           `${model.id} chosen for ${candidateClass}${via}: type=${model.type ?? '?'}` +
           `${model.quantization ? ', ' + model.quantization : ''}` +
           `${Number.isFinite(model.sizeGb) ? ', ' + model.sizeGb.toFixed(1) + 'GB' : ''}` +
-          `; admission ${plan.action}`,
+          `; admission ${plan.action}` +
+          `${sizesAvailable ? '' : '; selected without size information'}` +
+          `${needTools && !toolInfoAvailable
+            ? '; tool support unverified (backend does not report capabilities)'
+            : ''}`,
       };
     }
   }

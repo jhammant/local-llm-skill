@@ -18,7 +18,7 @@
 // measurement.
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import * as lmstudio from './lmstudio.mjs';
+import { resolve } from './providers/index.mjs';
 import { admit } from './ration.mjs';
 import { throughputKey, throughputPath } from './plan.mjs';
 
@@ -54,7 +54,9 @@ async function writeJsonAtomic(path, value) {
 }
 
 async function resolveConcurrency(endpoint, model, client) {
-  if (typeof client.ps !== 'function') return DEFAULT_CONCURRENCY;
+  if (typeof client.ps !== 'function' || client.capabilities?.loadedState === false) {
+    return DEFAULT_CONCURRENCY;
+  }
   const loaded = await client.ps(endpoint);
   const match = loaded.find((entry) => entry.model === model || entry.identifier === model);
   const parallel = Number(match?.parallel);
@@ -64,7 +66,7 @@ async function resolveConcurrency(endpoint, model, client) {
 export async function runBench({
   endpoint,
   model,
-  client = lmstudio,
+  client = null,
   admitFn = admit,
   admissionOptions = {},
   concurrency,
@@ -79,7 +81,8 @@ export async function runBench({
   if (typeof model !== 'string' || model.length === 0) {
     throw new Error('A model id is required for a bench');
   }
-  if (typeof client.chat !== 'function') {
+  const provider = client ?? resolve(endpoint);
+  if (typeof provider.chat !== 'function') {
     throw new Error('The bench client must implement chat()');
   }
   if (!Number.isInteger(runs) || runs <= 0) {
@@ -92,7 +95,7 @@ export async function runBench({
   // Time the load separately — first-request latency on a cold model would
   // otherwise be mistaken for slow inference.
   const loadStarted = nowFn();
-  const admission = await admitFn(endpoint, model, { ...admissionOptions, client });
+  const admission = await admitFn(endpoint, model, { ...admissionOptions, client: provider });
   if (!admission.ok) {
     throw new Error(`Cannot admit model "${model}" for bench: ${admission.reason}`);
   }
@@ -102,10 +105,10 @@ export async function runBench({
 
   // Warm-up: the first call after load pays one-off costs (cache fills, JIT-
   // style warm paths). Discard it — it is never timed.
-  await client.chat(endpoint, { model, messages, maxTokens });
+  await provider.chat(endpoint, { model, messages, maxTokens });
 
   const slots = concurrency == null
-    ? await resolveConcurrency(endpoint, model, client)
+    ? await resolveConcurrency(endpoint, model, provider)
     : concurrency;
   if (!Number.isInteger(slots) || slots <= 0) {
     throw new Error(`Bench concurrency must be a positive integer; received "${slots}"`);
@@ -115,7 +118,7 @@ export async function runBench({
   // dominated by prompt processing, so prompt_tokens / seconds is the prefill
   // rate. Single-stream, like the decode figure below.
   const prefillStarted = nowFn();
-  const prefill = await client.chat(endpoint, {
+  const prefill = await provider.chat(endpoint, {
     model,
     messages: [{ role: 'user', content: PREFILL_PROMPT }],
     maxTokens: PREFILL_MAX_TOKENS,
@@ -128,7 +131,7 @@ export async function runBench({
     let singleTokPerSec = 0;
     for (let run = 0; run < runs; run += 1) {
       const singleStarted = nowFn();
-      const single = await client.chat(endpoint, { model, messages, maxTokens: tokenBudget });
+      const single = await provider.chat(endpoint, { model, messages, maxTokens: tokenBudget });
       const singleSeconds = Math.max(0.001, (nowFn() - singleStarted) / 1_000);
       singleTokPerSec += completionTokens(single.usage) / singleSeconds;
     }
@@ -139,7 +142,7 @@ export async function runBench({
     // reliable ETA predictor — comes straight from the same wall clock.
     const concurrentStarted = nowFn();
     const results = await Promise.all(
-      Array.from({ length: slots }, () => client.chat(endpoint, { model, messages, maxTokens: tokenBudget })),
+      Array.from({ length: slots }, () => provider.chat(endpoint, { model, messages, maxTokens: tokenBudget })),
     );
     const concurrentSeconds = Math.max(0.001, (nowFn() - concurrentStarted) / 1_000);
     const concurrentTokens = results.reduce((sum, result) => sum + completionTokens(result.usage), 0);

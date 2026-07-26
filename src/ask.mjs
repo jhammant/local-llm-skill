@@ -1,4 +1,4 @@
-import * as lmstudio from './lmstudio.mjs';
+import { resolve } from './providers/index.mjs';
 import { selectModel } from './catalog.mjs';
 import { admit, touch } from './ration.mjs';
 
@@ -14,7 +14,7 @@ export async function ask({
   maxTokens,
   reasoningEffort,
   signal,
-  client = lmstudio,
+  client = null,
   selectModelFn = selectModel,
   admitFn = admit,
   touchFn = touch,
@@ -28,13 +28,15 @@ export async function ask({
     throw new Error('A prompt is required');
   }
 
+  const provider = client ?? resolve(endpoint);
+
   let modelId = model;
   if (!modelId) {
     const selected = await selectModelFn({
       class: uncensored ? 'security' : (jobClass ?? 'workhorse'),
       endpoint,
       requireTools: Array.isArray(tools) && tools.length > 0,
-      client,
+      client: provider,
       admissionOptions,
     });
     modelId = selected.id;
@@ -42,14 +44,14 @@ export async function ask({
 
   const admission = await admitFn(endpoint, modelId, {
     ...admissionOptions,
-    client,
+    client: provider,
   });
   if (!admission.ok) {
     throw new Error(`Cannot admit model "${modelId}": ${admission.reason}`);
   }
   let lruIdentifier = modelId;
-  if (typeof client.ps === 'function') {
-    const loaded = await client.ps(endpoint);
+  if (typeof provider.ps === 'function' && provider.capabilities?.loadedState !== false) {
+    const loaded = await provider.ps(endpoint);
     const match = loaded.find(
       (entry) => entry.model === modelId || entry.identifier === modelId,
     );
@@ -60,7 +62,7 @@ export async function ask({
     ...(system == null ? [] : [{ role: 'system', content: system }]),
     { role: 'user', content: prompt },
   ];
-  const result = await client.chat(endpoint, {
+  const result = await provider.chat(endpoint, {
     model: modelId,
     messages,
     tools,

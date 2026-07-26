@@ -1,11 +1,23 @@
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { KINDS } from './providers/index.mjs';
 
 export const LOCAL_ENDPOINT = Object.freeze({
   id: 'local',
+  kind: 'lmstudio',
   label: 'LM Studio (this Mac)',
   baseUrl: 'http://127.0.0.1:1234',
+  apiKey: null,
+  control: 'cli',
+  capacityGb: null,
+});
+
+export const OLLAMA_ENDPOINT = Object.freeze({
+  id: 'ollama',
+  kind: 'ollama',
+  label: 'Ollama (this Mac)',
+  baseUrl: 'http://127.0.0.1:11434',
   apiKey: null,
   control: 'cli',
   capacityGb: null,
@@ -27,20 +39,64 @@ function validateEndpoint(endpoint, source) {
   if (typeof endpoint.baseUrl !== 'string' || endpoint.baseUrl.length === 0) {
     throw new Error(`Invalid endpoint "${endpoint.id}" in ${source}: "baseUrl" is required`);
   }
-  if (!['cli', 'jit', 'none'].includes(endpoint.control)) {
+  // Back-compat: entries written before multi-backend support have no `kind`
+  // and are LM Studio endpoints.
+  const kind = endpoint.kind ?? 'lmstudio';
+  if (!KINDS.includes(kind)) {
+    throw new Error(
+      `Invalid endpoint "${endpoint.id}" in ${source}: kind must be one of ${KINDS.join(', ')}`,
+    );
+  }
+  const control = endpoint.control ?? (kind === 'openai' ? 'none' : 'cli');
+  if (!['cli', 'jit', 'none'].includes(control)) {
     throw new Error(
       `Invalid endpoint "${endpoint.id}" in ${source}: control must be "cli", "jit", or "none"`,
     );
   }
+  // An API key is read from the named environment variable, never stored
+  // inline in the registry file.
+  const apiKey = endpoint.apiKey
+    ?? (endpoint.apiKeyEnv ? process.env[endpoint.apiKeyEnv] : null)
+    ?? null;
 
   return {
     id: endpoint.id,
+    kind,
     label: endpoint.label ?? endpoint.id,
     baseUrl: endpoint.baseUrl.replace(/\/+$/, ''),
-    apiKey: endpoint.apiKey ?? null,
-    control: endpoint.control,
+    apiKey,
+    control,
     capacityGb: endpoint.capacityGb ?? null,
   };
+}
+
+// Auto-detection, used only when no registry file exists: probe the two
+// default ports in parallel and register whichever backend answers. Both may
+// be registered simultaneously; neither answering is an empty list, not an
+// error.
+const PROBES = Object.freeze([
+  { endpoint: LOCAL_ENDPOINT, pathname: '/api/v0/models' },
+  { endpoint: OLLAMA_ENDPOINT, pathname: '/api/tags' },
+]);
+
+async function probeReachable(probe, options) {
+  const fetchFn = options.fetchFn ?? globalThis.fetch;
+  if (typeof fetchFn !== 'function') return false;
+  try {
+    const response = await fetchFn(`${probe.endpoint.baseUrl}${probe.pathname}`, {
+      signal: AbortSignal.timeout(options.probeTimeoutMs ?? 750),
+    });
+    return Boolean(response?.ok);
+  } catch {
+    return false;
+  }
+}
+
+export async function detectEndpoints(options = {}) {
+  const results = await Promise.all(
+    PROBES.map(async (probe) => (await probeReachable(probe, options) ? { ...probe.endpoint } : null)),
+  );
+  return results.filter(Boolean);
 }
 
 async function readRegistry(options = {}) {
@@ -50,7 +106,8 @@ async function readRegistry(options = {}) {
     parsed = JSON.parse(await readFile(path, 'utf8'));
   } catch (error) {
     if (error?.code === 'ENOENT') {
-      return { endpoints: [{ ...LOCAL_ENDPOINT }], defaultId: 'local' };
+      const detected = await detectEndpoints(options);
+      return { endpoints: detected, defaultId: detected[0]?.id ?? null };
     }
     if (error instanceof SyntaxError) {
       throw new Error(`Could not parse endpoint registry ${path}: ${error.message}`, {
@@ -104,5 +161,11 @@ export async function getEndpoint(id, options = {}) {
 
 export async function defaultEndpoint(options = {}) {
   const { endpoints, defaultId } = await readRegistry(options);
-  return endpoints.find((endpoint) => endpoint.id === defaultId);
+  const endpoint = endpoints.find((candidate) => candidate.id === defaultId);
+  if (!endpoint) {
+    throw new Error(
+      'No endpoints configured and no local backend detected (probed LM Studio on 127.0.0.1:1234 and Ollama on 127.0.0.1:11434)',
+    );
+  }
+  return endpoint;
 }

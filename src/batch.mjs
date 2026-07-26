@@ -1,6 +1,6 @@
 import { open, readFile, mkdir, truncate } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
-import * as lmstudio from './lmstudio.mjs';
+import { resolve as resolveProvider } from './providers/index.mjs';
 import { touch } from './ration.mjs';
 
 export const ITEM_LINE = Symbol('local-llm input line');
@@ -262,7 +262,7 @@ function wait(ms) {
 }
 
 async function determineParallel(endpoint, model, client) {
-  if (typeof client.ps !== 'function') {
+  if (typeof client.ps !== 'function' || client.capabilities?.loadedState === false) {
     return { concurrency: 4, identifier: model };
   }
   const loaded = await client.ps(endpoint);
@@ -294,13 +294,14 @@ export async function runBatch({
   restart = false,
   onProgress,
   signal,
-  client = lmstudio,
+  client = null,
   sleep = wait,
   touchFn = touch,
   touchOptions = {},
   allowed = null,
 } = {}) {
   requireEndpoint(endpoint);
+  const provider = client ?? resolveProvider(endpoint);
   if (typeof model !== 'string' || model.length === 0) {
     throw new Error('A model id is required for a batch');
   }
@@ -347,7 +348,7 @@ export async function runBatch({
   let effectiveConcurrency = concurrency == null ? 4 : validateConcurrency(concurrency);
   let lruIdentifier = model;
   if (prepared.length > 0) {
-    const detected = await determineParallel(endpoint, model, client);
+    const detected = await determineParallel(endpoint, model, provider);
     lruIdentifier = detected.identifier;
     if (concurrency == null) effectiveConcurrency = detected.concurrency;
   }
@@ -427,7 +428,7 @@ export async function runBatch({
               `${allowed.join(', ')}. Output only that word, nothing else.`,
           });
         }
-        const result = await client.chat(endpoint, { model, messages, reasoningEffort });
+        const result = await provider.chat(endpoint, { model, messages, reasoningEffort });
         const raw = outputText(result.message);
 
         if (allowedSet) {
