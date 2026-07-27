@@ -96,10 +96,11 @@ export async function chat(
   };
 }
 
-export async function embed(endpoint, { model, input }, options = {}) {
+export async function embed(endpoint, { model, input, signal }, options = {}) {
   return requestJson(endpoint, '/v1/embeddings', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ model, input }),
+    signal,
   }, options);
 }

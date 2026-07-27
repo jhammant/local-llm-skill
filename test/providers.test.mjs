@@ -79,10 +79,38 @@ test('an endpoint without a kind resolves to the lmstudio provider', () => {
   assert.equal(resolve(legacy).kind, 'lmstudio');
   assert.equal(resolve({ kind: 'ollama' }).kind, 'ollama');
   assert.equal(resolve({ kind: 'openai' }).kind, 'openai');
+  assert.equal(resolve({ kind: 'aiod' }).kind, 'aiod');
   assert.equal(can(legacy, 'sizes'), true);
   assert.equal(can({ kind: 'openai' }, 'sizes'), false);
   assert.equal(can({ kind: 'openai' }, 'loadedState'), false);
   assert.throws(() => resolve({ kind: 'wat' }), /Unknown endpoint kind "wat"/);
+});
+
+test('aiod provider refuses a public request when the bearer token is missing', async () => {
+  let fetchCalls = 0;
+  const provider = resolve({ kind: 'aiod' });
+  await assert.rejects(
+    provider.chat(
+      {
+        id: 'burst',
+        kind: 'aiod',
+        baseUrl: 'http://203.0.113.20:8000',
+        apiKey: null,
+      },
+      {
+        model: 'org/model',
+        messages: [{ role: 'user', content: 'private' }],
+        allowRemoteData: true,
+      },
+      {
+        fetchFn: async () => {
+          fetchCalls += 1;
+        },
+      },
+    ),
+    /no bearer token/,
+  );
+  assert.equal(fetchCalls, 0);
 });
 
 test('src/lmstudio.mjs is a thin re-export of src/providers/lmstudio.mjs', () => {
@@ -337,7 +365,12 @@ test('auto-detection registers both backends when both probes succeed', async (t
   assert.equal(detected[0].kind, 'lmstudio');
   assert.equal(detected[1].kind, 'ollama');
 
-  const endpoints = await listEndpoints({ configPath: join(directory, 'missing.json'), fetchFn });
+  const endpoints = await listEndpoints({
+    configPath: join(directory, 'missing.json'),
+    fetchFn,
+    // Keep optional host tools out of this hermetic backend-probe test.
+    env: { PATH: '/usr/bin:/bin' },
+  });
   assert.deepEqual(endpoints.map((endpoint) => endpoint.id), ['local', 'ollama']);
 });
 
@@ -346,4 +379,34 @@ test('auto-detection registers nothing when both probes fail, without throwing',
     throw new Error('connection refused');
   };
   assert.deepEqual(await detectEndpoints({ fetchFn }), []);
+});
+
+test('a configured burst endpoint disappears cleanly when aiod is absent', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'local-llm-no-aiod-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const configPath = join(directory, 'endpoints.json');
+  await writeFile(configPath, JSON.stringify({
+    default: 'local',
+    endpoints: [
+      {
+        id: 'local',
+        kind: 'lmstudio',
+        baseUrl: 'http://127.0.0.1:1234',
+      },
+      {
+        id: 'burst',
+        kind: 'aiod',
+        control: 'aiod',
+      },
+    ],
+  }));
+
+  const endpoints = await listEndpoints({
+    configPath,
+    env: { AIOD_BIN: join(directory, 'missing-aiod'), PATH: '' },
+    fetchFn: async () => {
+      throw new Error('proxy absent');
+    },
+  });
+  assert.deepEqual(endpoints.map((endpoint) => endpoint.id), ['local']);
 });

@@ -1,6 +1,7 @@
 import { resolve } from './providers/index.mjs';
 import { selectModel } from './catalog.mjs';
 import { admit, touch } from './ration.mjs';
+import { requireRemoteDataOptIn } from './remote-data.mjs';
 
 export async function ask({
   endpoint,
@@ -20,6 +21,7 @@ export async function ask({
   touchFn = touch,
   admissionOptions = {},
   touchOptions = {},
+  allowRemoteData = false,
 } = {}) {
   if (!endpoint || typeof endpoint !== 'object') {
     throw new Error('An endpoint object is required');
@@ -27,6 +29,7 @@ export async function ask({
   if (typeof prompt !== 'string' || prompt.length === 0) {
     throw new Error('A prompt is required');
   }
+  requireRemoteDataOptIn(endpoint, allowRemoteData);
 
   const provider = client ?? resolve(endpoint);
 
@@ -70,6 +73,7 @@ export async function ask({
     maxTokens,
     reasoningEffort,
     signal,
+    allowRemoteData,
   });
   await touchFn(endpoint, lruIdentifier, touchOptions);
 

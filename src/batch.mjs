@@ -2,6 +2,7 @@ import { open, readFile, mkdir, truncate } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { resolve as resolveProvider } from './providers/index.mjs';
 import { touch } from './ration.mjs';
+import { requireRemoteDataOptIn } from './remote-data.mjs';
 
 export const ITEM_LINE = Symbol('local-llm input line');
 const RETRY_DELAYS_MS = [1_000, 4_000];
@@ -299,8 +300,10 @@ export async function runBatch({
   touchFn = touch,
   touchOptions = {},
   allowed = null,
+  allowRemoteData = false,
 } = {}) {
   requireEndpoint(endpoint);
+  requireRemoteDataOptIn(endpoint, allowRemoteData);
   const provider = client ?? resolveProvider(endpoint);
   if (typeof model !== 'string' || model.length === 0) {
     throw new Error('A model id is required for a batch');
@@ -428,7 +431,13 @@ export async function runBatch({
               `${allowed.join(', ')}. Output only that word, nothing else.`,
           });
         }
-        const result = await provider.chat(endpoint, { model, messages, reasoningEffort });
+        const result = await provider.chat(endpoint, {
+          model,
+          messages,
+          reasoningEffort,
+          signal,
+          allowRemoteData,
+        });
         const raw = outputText(result.message);
 
         if (allowedSet) {
@@ -458,6 +467,7 @@ export async function runBatch({
         };
       } catch (error) {
         lastError = error;
+        if (signal?.aborted) break;
         if (attempt < RETRY_DELAYS_MS.length) {
           await sleep(RETRY_DELAYS_MS[attempt]);
         }

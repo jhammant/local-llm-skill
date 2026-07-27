@@ -74,6 +74,8 @@ export async function runBench({
   maxTokens = BENCH_MAX_TOKENS,
   runs = DEFAULT_RUNS,
   nowFn = () => Date.now(),
+  allowRemoteData = false,
+  signal,
 } = {}) {
   if (!endpoint || typeof endpoint !== 'object' || typeof endpoint.id !== 'string') {
     throw new Error('An endpoint object is required for a bench');
@@ -105,7 +107,13 @@ export async function runBench({
 
   // Warm-up: the first call after load pays one-off costs (cache fills, JIT-
   // style warm paths). Discard it — it is never timed.
-  await provider.chat(endpoint, { model, messages, maxTokens });
+  await provider.chat(endpoint, {
+    model,
+    messages,
+    maxTokens,
+    allowRemoteData,
+    signal,
+  });
 
   const slots = concurrency == null
     ? await resolveConcurrency(endpoint, model, provider)
@@ -122,6 +130,8 @@ export async function runBench({
     model,
     messages: [{ role: 'user', content: PREFILL_PROMPT }],
     maxTokens: PREFILL_MAX_TOKENS,
+    allowRemoteData,
+    signal,
   });
   const prefillSeconds = Math.max(0.001, (nowFn() - prefillStarted) / 1_000);
   const promptTokPerSec = promptTokens(prefill.usage) / prefillSeconds;
@@ -131,7 +141,13 @@ export async function runBench({
     let singleTokPerSec = 0;
     for (let run = 0; run < runs; run += 1) {
       const singleStarted = nowFn();
-      const single = await provider.chat(endpoint, { model, messages, maxTokens: tokenBudget });
+      const single = await provider.chat(endpoint, {
+        model,
+        messages,
+        maxTokens: tokenBudget,
+        allowRemoteData,
+        signal,
+      });
       const singleSeconds = Math.max(0.001, (nowFn() - singleStarted) / 1_000);
       singleTokPerSec += completionTokens(single.usage) / singleSeconds;
     }
@@ -142,7 +158,16 @@ export async function runBench({
     // reliable ETA predictor — comes straight from the same wall clock.
     const concurrentStarted = nowFn();
     const results = await Promise.all(
-      Array.from({ length: slots }, () => provider.chat(endpoint, { model, messages, maxTokens: tokenBudget })),
+      Array.from(
+        { length: slots },
+        () => provider.chat(endpoint, {
+          model,
+          messages,
+          maxTokens: tokenBudget,
+          allowRemoteData,
+          signal,
+        }),
+      ),
     );
     const concurrentSeconds = Math.max(0.001, (nowFn() - concurrentStarted) / 1_000);
     const concurrentTokens = results.reduce((sum, result) => sum + completionTokens(result.usage), 0);

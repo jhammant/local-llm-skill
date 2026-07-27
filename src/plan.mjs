@@ -10,12 +10,63 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ITEM_LINE, normalizeAnswer, runBatch, substituteTemplate } from './batch.mjs';
 import { resolve } from './providers/index.mjs';
+import { requireRemoteDataOptIn } from './remote-data.mjs';
 
 export const SAMPLE_SIZE = 20;
 export const TIMING_SAMPLE_SIZE = 8;
 export const PROBE_SAMPLE_SIZE = 3;
 export const ASSUMED_COMPLETION_TOKENS = 300;
 export const ASSUMED_TOK_PER_SEC = 30;
+export const ASSUMED_BURST_TOK_PER_SEC = 340;
+
+export function buildBurstComparison(
+  localPlan,
+  launchPlan,
+  {
+    tokPerSec = ASSUMED_BURST_TOK_PER_SEC,
+    rateSource = `assumed default (${ASSUMED_BURST_TOK_PER_SEC} tok/s aggregate)`,
+  } = {},
+) {
+  if (!localPlan || !Number.isFinite(Number(localPlan.totalTokens))) {
+    throw new Error('A local plan with totalTokens is required for a burst comparison');
+  }
+  const rate = Number(tokPerSec);
+  if (!Number.isFinite(rate) || rate <= 0) {
+    throw new Error('Burst aggregate tok/s must be a positive number');
+  }
+  const pricePerHour = Number(launchPlan?.pricePerHour);
+  if (!Number.isFinite(pricePerHour) || pricePerHour < 0) {
+    throw new Error('A burst launch plan with a live non-negative $/hr price is required');
+  }
+  const etaSeconds = Number(localPlan.totalTokens) / rate;
+  const estimatedCost = pricePerHour * etaSeconds / 3_600;
+  const localEtaSeconds = Number(localPlan.etaSeconds);
+  const timeSavedSeconds = Number.isFinite(localEtaSeconds)
+    ? localEtaSeconds - etaSeconds
+    : null;
+  return {
+    local: {
+      endpoint: localPlan.endpoint,
+      model: localPlan.model,
+      etaSeconds: localPlan.etaSeconds,
+      estimatedCost: 0,
+      basis: localPlan.etaMethod,
+    },
+    burst: {
+      endpoint: 'burst',
+      model: launchPlan.model ?? launchPlan.profile,
+      gpu: launchPlan.gpu,
+      pricePerHour,
+      tokPerSec: rate,
+      rateSource,
+      etaSeconds,
+      estimatedCost,
+      idleMinutes: launchPlan.idleMinutes,
+      ttlHours: launchPlan.ttlHours,
+    },
+    timeSavedSeconds,
+  };
+}
 
 export function throughputPath(options = {}) {
   return options.throughputPath
@@ -169,7 +220,16 @@ function probeCompletionTokens(usage) {
 // set — the same constrained-output repair (show the model its out-of-set
 // answer, restate the constraint, retry). The measured completion length only
 // reflects reality if the probe walks the same path the batch will.
-async function probeChat(client, endpoint, model, messages, allowed, reasoningEffort) {
+async function probeChat(
+  client,
+  endpoint,
+  model,
+  messages,
+  allowed,
+  reasoningEffort,
+  allowRemoteData,
+  signal,
+) {
   const allowedSet = Array.isArray(allowed) && allowed.length > 0;
   let lastRaw = null;
   for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -183,7 +243,13 @@ async function probeChat(client, endpoint, model, messages, allowed, reasoningEf
           + `${allowed.join(', ')}. Output only that word, nothing else.`,
       });
     }
-    const result = await client.chat(endpoint, { model, messages: attemptMessages, reasoningEffort });
+    const result = await client.chat(endpoint, {
+      model,
+      messages: attemptMessages,
+      reasoningEffort,
+      allowRemoteData,
+      signal,
+    });
     const raw = result.message?.content ?? result.message;
     if (!allowedSet || normalizeAnswer(raw, allowed) != null) return result;
     lastRaw = raw;
@@ -208,7 +274,10 @@ export async function measureCompletionTokens({
   reasoningEffort,
   sampleSize = PROBE_SAMPLE_SIZE,
   client = null,
+  allowRemoteData = false,
+  signal,
 } = {}) {
+  requireRemoteDataOptIn(endpoint, allowRemoteData);
   const provider = client ?? resolve(endpoint);
   const sample = sampleItems(items, sampleSize);
   if (sample.length === 0) return null;
@@ -219,7 +288,16 @@ export async function measureCompletionTokens({
       ...(system == null ? [] : [{ role: 'system', content: system }]),
       { role: 'user', content: prompt },
     ];
-    const result = await probeChat(provider, endpoint, model, messages, allowed, reasoningEffort);
+    const result = await probeChat(
+      provider,
+      endpoint,
+      model,
+      messages,
+      allowed,
+      reasoningEffort,
+      allowRemoteData,
+      signal,
+    );
     total += probeCompletionTokens(result.usage);
   }
   return {
@@ -260,7 +338,10 @@ export async function measureItemsPerSec({
   client = null,
   sleep,
   now = Date.now,
+  allowRemoteData = false,
+  signal,
 } = {}) {
+  requireRemoteDataOptIn(endpoint, allowRemoteData);
   const provider = client ?? resolve(endpoint);
   const sample = sampleItems(items, sampleSize);
   if (sample.length === 0) return null;
@@ -278,6 +359,8 @@ export async function measureItemsPerSec({
       concurrency,
       reasoningEffort,
       allowed,
+      allowRemoteData,
+      signal,
       client: provider,
       // A plan must not mutate ration/LRU state as a side effect of estimating.
       touchFn: async () => {},
@@ -347,6 +430,8 @@ export async function planBatch({
   client = null,
   sleep,
   now,
+  allowRemoteData = false,
+  signal,
   ...options
 } = {}) {
   if (!endpoint || typeof endpoint !== 'object' || typeof endpoint.id !== 'string') {
@@ -356,6 +441,7 @@ export async function planBatch({
     throw new Error('A model id is required for a plan');
   }
   if (!Array.isArray(items)) throw new Error('Plan items must be an array');
+  requireRemoteDataOptIn(endpoint, allowRemoteData);
 
   const provider = client ?? resolve(endpoint);
   const itemCount = items.length;
@@ -392,10 +478,13 @@ export async function planBatch({
         sampleSize: timingSampleSize,
         concurrency,
         client: provider,
+        allowRemoteData,
+        signal,
         ...(sleep == null ? {} : { sleep }),
         ...(now == null ? {} : { now }),
       });
     } catch (error) {
+      if (signal?.aborted) throw error;
       sampleError = error;
     }
   }
@@ -424,6 +513,8 @@ export async function planBatch({
         reasoningEffort,
         sampleSize: probeSampleSize,
         client: provider,
+        allowRemoteData,
+        signal,
       });
       completion = probed == null
         ? { value: ASSUMED_COMPLETION_TOKENS, source: 'assumed default' }
@@ -432,6 +523,7 @@ export async function planBatch({
           source: `measured (n=${probed.sampled} sample)`,
         };
     } catch (error) {
+      if (signal?.aborted) throw error;
       completion = {
         value: ASSUMED_COMPLETION_TOKENS,
         source: `assumed default (probe failed: ${error.message})`,

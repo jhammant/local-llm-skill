@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { KINDS } from './providers/index.mjs';
+import { burstEndpoint } from './aiod.mjs';
 
 export const LOCAL_ENDPOINT = Object.freeze({
   id: 'local',
@@ -23,6 +24,22 @@ export const OLLAMA_ENDPOINT = Object.freeze({
   capacityGb: null,
 });
 
+export const BURST_ENDPOINT = Object.freeze({
+  id: 'burst',
+  kind: 'aiod',
+  label: 'aiod (vast.ai)',
+  baseUrl: null,
+  apiKey: null,
+  control: 'aiod',
+  capacityGb: null,
+  profile: 'qwen3-coder-30b',
+  model: null,
+  quant: 'fp8',
+  maxPricePerHour: 3,
+  idleMinutes: null,
+  ttlHours: null,
+});
+
 function endpointsPath(options = {}) {
   return options.configPath
     ?? process.env.LOCAL_LLM_ENDPOINTS_FILE
@@ -36,21 +53,24 @@ function validateEndpoint(endpoint, source) {
   if (typeof endpoint.id !== 'string' || endpoint.id.length === 0) {
     throw new Error(`Invalid endpoint in ${source}: "id" is required`);
   }
-  if (typeof endpoint.baseUrl !== 'string' || endpoint.baseUrl.length === 0) {
+  const kind = endpoint.kind ?? 'lmstudio';
+  const control = endpoint.control ?? (kind === 'openai' ? 'none' : 'cli');
+  if (
+    (typeof endpoint.baseUrl !== 'string' || endpoint.baseUrl.length === 0)
+    && !(kind === 'aiod' && control === 'aiod')
+  ) {
     throw new Error(`Invalid endpoint "${endpoint.id}" in ${source}: "baseUrl" is required`);
   }
   // Back-compat: entries written before multi-backend support have no `kind`
   // and are LM Studio endpoints.
-  const kind = endpoint.kind ?? 'lmstudio';
   if (!KINDS.includes(kind)) {
     throw new Error(
       `Invalid endpoint "${endpoint.id}" in ${source}: kind must be one of ${KINDS.join(', ')}`,
     );
   }
-  const control = endpoint.control ?? (kind === 'openai' ? 'none' : 'cli');
-  if (!['cli', 'jit', 'none'].includes(control)) {
+  if (!['cli', 'jit', 'none', 'aiod'].includes(control)) {
     throw new Error(
-      `Invalid endpoint "${endpoint.id}" in ${source}: control must be "cli", "jit", or "none"`,
+      `Invalid endpoint "${endpoint.id}" in ${source}: control must be "cli", "jit", "none", or "aiod"`,
     );
   }
   // An API key is read from the named environment variable, never stored
@@ -63,10 +83,24 @@ function validateEndpoint(endpoint, source) {
     id: endpoint.id,
     kind,
     label: endpoint.label ?? endpoint.id,
-    baseUrl: endpoint.baseUrl.replace(/\/+$/, ''),
+    baseUrl: typeof endpoint.baseUrl === 'string'
+      ? endpoint.baseUrl.replace(/\/+$/, '')
+      : null,
     apiKey,
     control,
     capacityGb: endpoint.capacityGb ?? null,
+    ...(kind === 'aiod'
+      ? {
+        profile: endpoint.profile ?? 'qwen3-coder-30b',
+        model: endpoint.model ?? null,
+        quant: endpoint.quant ?? 'fp8',
+        maxPricePerHour: endpoint.maxPricePerHour ?? 3,
+        // Deliberately do not accept idle/TTL values from config. The flags
+        // must be present on every invocation that could spend money.
+        idleMinutes: null,
+        ttlHours: null,
+      }
+      : {}),
   };
 }
 
@@ -99,6 +133,28 @@ export async function detectEndpoints(options = {}) {
   return results.filter(Boolean);
 }
 
+async function appendBurstIfAvailable(endpoints, options) {
+  const burst = await burstEndpoint(options);
+  const index = endpoints.findIndex((endpoint) => endpoint.id === 'burst');
+  if (!burst.available) {
+    if (index >= 0) endpoints.splice(index, 1);
+    return endpoints;
+  }
+  if (index < 0) {
+    endpoints.push({ ...BURST_ENDPOINT, ...burst });
+  } else {
+    endpoints[index] = {
+      ...BURST_ENDPOINT,
+      ...endpoints[index],
+      ...burst,
+      // These remain per-invocation-only, even if present in the file.
+      idleMinutes: null,
+      ttlHours: null,
+    };
+  }
+  return endpoints;
+}
+
 async function readRegistry(options = {}) {
   const path = endpointsPath(options);
   let parsed;
@@ -107,7 +163,9 @@ async function readRegistry(options = {}) {
   } catch (error) {
     if (error?.code === 'ENOENT') {
       const detected = await detectEndpoints(options);
-      return { endpoints: detected, defaultId: detected[0]?.id ?? null };
+      const defaultId = detected[0]?.id ?? null;
+      await appendBurstIfAvailable(detected, options);
+      return { endpoints: detected, defaultId };
     }
     if (error instanceof SyntaxError) {
       throw new Error(`Could not parse endpoint registry ${path}: ${error.message}`, {
@@ -125,6 +183,7 @@ async function readRegistry(options = {}) {
   }
 
   const endpoints = rawEndpoints.map((endpoint) => validateEndpoint(endpoint, path));
+  await appendBurstIfAvailable(endpoints, options);
   const ids = new Set();
   for (const endpoint of endpoints) {
     if (ids.has(endpoint.id)) {
@@ -133,9 +192,16 @@ async function readRegistry(options = {}) {
     ids.add(endpoint.id);
   }
 
-  const defaultId = Array.isArray(parsed)
+  if (endpoints.length === 0) return { endpoints, defaultId: null };
+
+  let defaultId = Array.isArray(parsed)
     ? (ids.has('local') ? 'local' : endpoints[0].id)
     : (parsed.default ?? parsed.defaultId ?? (ids.has('local') ? 'local' : endpoints[0].id));
+  // An optional configured burst disappearing because aiod is absent is not
+  // a malformed registry. Fall back to a free endpoint without error.
+  if (!ids.has(defaultId) && defaultId === 'burst') {
+    defaultId = ids.has('local') ? 'local' : endpoints[0]?.id ?? null;
+  }
   if (!ids.has(defaultId)) {
     throw new Error(`Endpoint registry ${path} names unknown default endpoint "${defaultId}"`);
   }

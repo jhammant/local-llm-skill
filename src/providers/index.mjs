@@ -4,11 +4,13 @@
 import * as lmstudio from './lmstudio.mjs';
 import * as ollama from './ollama.mjs';
 import * as openai from './openai.mjs';
+import * as aiod from './aiod.mjs';
 
 const PROVIDERS = Object.freeze({
   lmstudio,
   ollama,
   openai,
+  aiod,
 });
 
 export const KINDS = Object.freeze(Object.keys(PROVIDERS));

@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  buildBurstComparison,
   estimateEtaSeconds,
   estimateTokens,
   planBatch,
@@ -33,6 +34,34 @@ test('ETA regression: 8 items in 3.5s over 5000 items is ~2190s, not ~547s', () 
   assert.equal(remainingItems, 4992);
   assert.ok(etaSeconds > 2100 && etaSeconds < 2300, `eta ${etaSeconds} should be ~2190s`);
   assert.ok(etaSeconds > 1000, 'ETA must not be divided by the slot count again');
+});
+
+test('burst comparison uses total tokens divided by aggregate rate and live price', () => {
+  const comparison = buildBurstComparison(
+    {
+      endpoint: 'local',
+      model: 'local/model',
+      totalTokens: 340_000,
+      etaSeconds: 3_600,
+      etaMethod: 'measured end-to-end',
+    },
+    {
+      profile: 'coder',
+      gpu: '1x H100',
+      pricePerHour: 2.4,
+      idleMinutes: 20,
+      ttlHours: 2,
+    },
+    {
+      tokPerSec: 340,
+      rateSource: 'assumed default',
+    },
+  );
+
+  assert.equal(comparison.burst.etaSeconds, 1_000);
+  assert.ok(Math.abs(comparison.burst.estimatedCost - (2.4 * 1_000 / 3_600)) < 1e-12);
+  assert.equal(comparison.timeSavedSeconds, 2_600);
+  assert.equal(comparison.burst.rateSource, 'assumed default');
 });
 
 test('estimateEtaSeconds validates its inputs', () => {

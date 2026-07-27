@@ -192,3 +192,35 @@ test('worker pool never exceeds the requested concurrency cap', async (t) => {
   assert.equal(maximum, 3);
   assert.equal((await records(out)).length, 12);
 });
+
+test('a burst endpoint refuses batch items without --allow-remote-data', async (t) => {
+  const directory = await temporaryDirectory(t);
+  const out = join(directory, 'results.jsonl');
+  let calls = 0;
+  const client = {
+    async chat() {
+      calls += 1;
+      return { message: { content: 'must not happen' } };
+    },
+  };
+
+  await assert.rejects(
+    runBatch({
+      endpoint: {
+        id: 'burst',
+        kind: 'aiod',
+        control: 'aiod',
+        baseUrl: 'http://public-burst.test',
+      },
+      model: 'Qwen/test',
+      template: '{{value}}',
+      items: [{ value: 'private input' }],
+      out,
+      client,
+      touchFn: noTouch,
+    }),
+    /--allow-remote-data/,
+  );
+  assert.equal(calls, 0);
+  await assert.rejects(readFile(out), { code: 'ENOENT' });
+});

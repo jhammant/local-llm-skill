@@ -2,6 +2,7 @@
 
 import { readFile } from 'node:fs/promises';
 import { realpathSync } from 'node:fs';
+import { createInterface } from 'node:readline/promises';
 import { pathToFileURL } from 'node:url';
 import { getEndpoint, defaultEndpoint, listEndpoints } from './endpoints.mjs';
 import { resolve } from './providers/index.mjs';
@@ -22,9 +23,25 @@ import {
   runBatch,
   substituteTemplate,
 } from './batch.mjs';
-import { planBatch } from './plan.mjs';
+import {
+  ASSUMED_BURST_TOK_PER_SEC,
+  buildBurstComparison,
+  planBatch,
+  readThroughput,
+  throughputKey,
+} from './plan.mjs';
 import { recordThroughput, runBench } from './bench.mjs';
 import { checkUpdates } from './updates.mjs';
+import {
+  AIOD_INSTALL_HINT,
+  burstEndpoint,
+  burstWarning,
+  propose as proposeBurst,
+  spin as spinBurst,
+  status as burstStatus,
+  teardown as teardownBurst,
+} from './aiod.mjs';
+import { isBurstEndpoint, requireRemoteDataOptIn } from './remote-data.mjs';
 
 const VERSION = '1.0.0';
 const VALUE_OPTIONS = new Set([
@@ -42,6 +59,12 @@ const VALUE_OPTIONS = new Set([
   'max-tokens',
   'runs',
   'reasoning-effort',
+  'profile',
+  'quant',
+  'max-price',
+  'idle',
+  'ttl',
+  'overflow',
 ]);
 const BOOLEAN_OPTIONS = new Set([
   'json',
@@ -52,6 +75,8 @@ const BOOLEAN_OPTIONS = new Set([
   'all',
   'no-sample',
   'check-updates',
+  'yes',
+  'allow-remote-data',
   'help',
   'version',
 ]);
@@ -63,16 +88,25 @@ Usage:
   local-llm models [--fit] [--class <c>] [--check-updates] [--json]
   local-llm ps [--json]
   local-llm budget [--json]
+  local-llm status [--json]
+  local-llm burst status
+  local-llm burst up [--profile p | --model m] [--quant q] [--max-price N]
+      --idle M --ttl H [--yes]
+  local-llm burst down
   local-llm ask <prompt…> [--class c] [--model m] [--uncensored]
-      [--reasoning-effort e] [--json]
+      [--reasoning-effort e] [--endpoint burst] [--allow-remote-data]
+      [--idle M --ttl H] [--yes] [--json]
   local-llm batch <items.jsonl> (--template f | --prompt s) [--out f]
       [--class c] [--model m] [--field name] [--system f]
       [--concurrency n] [--allow a,b,c] [--reasoning-effort e]
-      [--restart] [--dry-run] [--json]
+      [--endpoint burst | --overflow burst] [--allow-remote-data]
+      [--idle M --ttl H] [--yes] [--restart] [--dry-run] [--json]
   local-llm plan <items.jsonl> (--template f | --prompt s)
       [--class c] [--model m] [--field name] [--allow a,b,c]
-      [--reasoning-effort e] [--sample n] [--no-sample] [--json]
-  local-llm bench [--model m] [--class c] [--max-tokens n] [--runs n] [--json]
+      [--reasoning-effort e] [--sample n] [--no-sample]
+      [--endpoint burst] [--allow-remote-data] [--idle M --ttl H] [--yes] [--json]
+  local-llm bench [--model m] [--class c] [--max-tokens n] [--runs n]
+      [--endpoint burst] [--allow-remote-data] [--idle M --ttl H] [--yes] [--json]
   local-llm load <model> [--dry-run] [--json]
   local-llm unload <identifier | --all> [--json]
   local-llm pin <model> | unpin <model> | pins [--json]
@@ -80,6 +114,10 @@ Usage:
 
 Global:
   --endpoint <id>   endpoint registry id (default: configured local endpoint)
+  --allow-remote-data   per-run permission to send data to the public burst endpoint
+  --idle <minutes>  required on every invocation that may rent a burst GPU
+  --ttl <hours>     required hard lifetime limit on every burst spin
+  --yes             confirm this invocation's displayed burst plan without stdin
   --reasoning-effort <none|low|medium|high>   opt-in; omitted from the request
                     when unset, for thinking models on ask/batch/plan
 `;
@@ -160,6 +198,339 @@ async function fileOrLiteral(value) {
 
 async function chooseEndpoint(id) {
   return id ? getEndpoint(id) : defaultEndpoint();
+}
+
+function numericOption(options, name, { integer = false } = {}) {
+  if (options[name] == null) return undefined;
+  const value = Number(options[name]);
+  if (!Number.isFinite(value) || value <= 0 || (integer && !Number.isInteger(value))) {
+    const flag = name.replace(/[A-Z]/g, (character) => `-${character.toLowerCase()}`);
+    throw new Error(`--${flag} requires a positive ${integer ? 'integer' : 'number'}; received "${options[name]}"`);
+  }
+  return value;
+}
+
+function formatBurstPlan(plan) {
+  return [
+    'BURST LAUNCH PLAN — THIS WILL SPEND REAL MONEY',
+    `  Model/profile:      ${plan.model ?? plan.profile ?? '?'}`,
+    `  GPU:                ${plan.gpu}`,
+    `  Live price:         $${plan.pricePerHour.toFixed(2)}/hr`,
+    `  Estimated runtime:  ${formatDuration(plan.estimatedRuntimeMinutes * 60_000)} (estimate)`,
+    `  Estimated total:    ~$${plan.estimatedTotalCost.toFixed(2)} (estimate)`,
+    `  Idle timeout:       ${plan.idleMinutes}m`,
+    `  TTL hard backstop:  ${plan.ttlHours}h`,
+  ].join('\n');
+}
+
+async function confirmBurstPlan(signal) {
+  const input = createInterface({ input: process.stdin, output: process.stderr });
+  try {
+    const answer = await input.question(
+      'Rent this GPU? Type y to confirm this invocation: ',
+      signal == null ? undefined : { signal },
+    );
+    return answer.trim().toLowerCase() === 'y';
+  } catch {
+    return false;
+  } finally {
+    input.close();
+  }
+}
+
+export function installInterruptHandlers(controller, processLike = process) {
+  let interruptedSignal = null;
+  const onSigint = () => {
+    interruptedSignal = 'SIGINT';
+    controller.abort();
+  };
+  const onSigterm = () => {
+    interruptedSignal = 'SIGTERM';
+    controller.abort();
+  };
+  // Keep swallowing repeated termination signals until teardown completes;
+  // a second Ctrl-C must not kill the process while the paid instance is
+  // still being destroyed.
+  processLike.on('SIGINT', onSigint);
+  processLike.on('SIGTERM', onSigterm);
+  return {
+    get signal() {
+      return interruptedSignal;
+    },
+    remove() {
+      processLike.removeListener('SIGINT', onSigint);
+      processLike.removeListener('SIGTERM', onSigterm);
+    },
+  };
+}
+
+function mergeBurstEndpoint(endpoint, current) {
+  return {
+    ...endpoint,
+    kind: 'aiod',
+    control: 'aiod',
+    available: true,
+    baseUrl: current.baseUrl,
+    apiKey: current.apiKey,
+    model: current.model ?? endpoint.model ?? null,
+    quant: current.quant ?? endpoint.quant ?? null,
+    status: current,
+  };
+}
+
+async function activateBurstEndpoint(
+  endpoint,
+  options,
+  { estimatedRuntimeMinutes, model = null, signal, proposalOnly = false } = {},
+) {
+  const current = await burstStatus(
+    {
+      ...(endpoint.binary == null ? {} : { binary: endpoint.binary }),
+      signal,
+    },
+  );
+  if (current.serving && current.baseUrl) {
+    return { endpoint: mergeBurstEndpoint(endpoint, current), executed: false, existing: true };
+  }
+  const idle = numericOption(options, 'idle', { integer: true });
+  const ttl = numericOption(options, 'ttl');
+  // spin() repeats this validation. Keeping it here makes the CLI error name
+  // the missing per-invocation flags before any dry-run subprocess is started.
+  if (idle == null || ttl == null) {
+    throw new Error('Burst spin requires BOTH --idle <minutes> and --ttl <hours> on this invocation');
+  }
+  if (options.model && options.profile) {
+    throw new Error('Use either --model or --profile for a burst, not both');
+  }
+  const maxPrice = numericOption(options, 'maxPrice') ?? endpoint.maxPricePerHour ?? 3;
+  const result = await spinBurst(
+    {
+      model: options.model ?? model ?? undefined,
+      profile:
+        options.profile
+        ?? (options.model || model ? undefined : (endpoint.profile ?? 'qwen3-coder-30b')),
+      quant: options.quant ?? endpoint.quant ?? 'fp8',
+      maxPrice,
+      idle,
+      ttl,
+      estimatedRuntimeMinutes: estimatedRuntimeMinutes ?? ttl * 60,
+    },
+    {
+      binary: endpoint.binary,
+      confirmed: !proposalOnly && options.yes === true,
+      confirmFn: proposalOnly || options.yes ? undefined : () => confirmBurstPlan(signal),
+      onPlan: (plan) => (options.json ? process.stderr : process.stdout)
+        .write(`${formatBurstPlan(plan)}\n`),
+      onStdout: (chunk) => process.stderr.write(chunk),
+      onStderr: (chunk) => process.stderr.write(chunk),
+      signal,
+    },
+  );
+  if (!result.executed) return { endpoint, executed: false, proposed: true, plan: result.plan };
+  return {
+    endpoint: mergeBurstEndpoint(endpoint, result.endpoint),
+    executed: true,
+    existing: false,
+    plan: result.plan,
+  };
+}
+
+async function getAvailableBurstEndpoint() {
+  const endpoint = await burstEndpoint();
+  if (!endpoint.available) return null;
+  return endpoint;
+}
+
+export async function selectOverflowEndpoint({
+  endpoint,
+  model,
+  overflow,
+  admitFn = admit,
+  burstEndpointFn = getAvailableBurstEndpoint,
+} = {}) {
+  if (overflow == null) return { endpoint, model, overflowed: false };
+  if (overflow !== 'burst') {
+    throw new Error(`Unsupported --overflow target "${overflow}"; only "burst" is available`);
+  }
+  if (isBurstEndpoint(endpoint)) return { endpoint, model, overflowed: false };
+  const localPlan = await admitFn(endpoint, model, { dryRun: true });
+  if (localPlan.ok) {
+    return { endpoint, model, overflowed: false, admission: localPlan };
+  }
+  const burst = await burstEndpointFn();
+  if (!burst) {
+    return {
+      endpoint: null,
+      model,
+      overflowed: true,
+      unavailable: true,
+      reason: AIOD_INSTALL_HINT,
+      admission: localPlan,
+    };
+  }
+  return { endpoint: burst, model, overflowed: true, admission: localPlan };
+}
+
+async function currentBurstWarning() {
+  const current = await burstStatus();
+  if (!current.available) return null;
+  return burstWarning(current)
+    ?? (current.statusUnknown
+      ? `!!! BURST BILLING STATUS UNKNOWN — ${current.error ?? 'run "local-llm burst status" and check the provider console'} !!!`
+      : null);
+}
+
+async function printCurrentBurstWarning({ json = false } = {}) {
+  const warning = await currentBurstWarning();
+  if (!warning) return;
+  (json ? process.stderr : process.stdout).write(`${warning}\n`);
+}
+
+function burstStatusResult(current) {
+  return {
+    running: current.running,
+    serving: current.serving,
+    state: current.state,
+    instanceId: current.instanceId ?? null,
+    model: current.model,
+    gpu: current.gpu,
+    endpoint: current.baseUrl,
+    pricePerHour: current.pricePerHour,
+    costSoFar: current.costSoFar,
+    idleRemainingMinutes: current.idleRemaining,
+    ttlRemainingHours: current.ttlRemaining,
+  };
+}
+
+function printBurstStatus(current) {
+  const warning = burstWarning(current);
+  if (warning) process.stdout.write(`${warning}\n`);
+  if (current.statusUnknown) {
+    process.stdout.write(
+      `!!! BURST BILLING STATUS UNKNOWN — ${current.error ?? 'check the provider console immediately'} !!!\n`,
+    );
+    return;
+  }
+  if (!current.running) {
+    process.stdout.write('No burst instance live; nothing is billing.\n');
+    return;
+  }
+  process.stdout.write(
+    [
+      `State:              ${current.state ?? '?'}`,
+      `Model:              ${current.model ?? '?'}`,
+      `GPU:                ${current.gpu ?? '?'}`,
+      `Endpoint:           ${current.baseUrl ?? 'not serving yet'}`,
+      `Price:              ${current.pricePerHour == null ? '?' : `$${current.pricePerHour.toFixed(2)}/hr`}`,
+      `Cost so far:        ${current.costSoFar == null ? '?' : `$${current.costSoFar.toFixed(2)}`}`,
+      `Idle remaining:     ${current.idleRemaining == null ? '?' : `${current.idleRemaining.toFixed(1)}m`}`,
+      `TTL remaining:      ${current.ttlRemaining == null ? '?' : `${current.ttlRemaining.toFixed(2)}h`}`,
+    ].join('\n') + '\n',
+  );
+}
+
+async function burstCommand(options, args) {
+  if (args.length !== 1 || !['status', 'up', 'down'].includes(args[0])) {
+    throw new Error('burst requires exactly one subcommand: status, up, or down');
+  }
+  const [subcommand] = args;
+  if (subcommand === 'status') {
+    // Proxy-first status can still reveal an actively billing instance if the
+    // local aiod executable was removed after launch.
+    const current = await burstStatus();
+    if (!current.available) {
+      process.stdout.write(`${AIOD_INSTALL_HINT}\n`);
+      return 0;
+    }
+    if (options.json) {
+      const warning = burstWarning(current)
+        ?? (current.statusUnknown
+          ? `!!! BURST BILLING STATUS UNKNOWN — ${current.error ?? 'check the provider console immediately'} !!!`
+          : null);
+      if (warning) process.stderr.write(`${warning}\n`);
+      writeJson(burstStatusResult(current));
+    } else {
+      printBurstStatus(current);
+    }
+    return 0;
+  }
+  const endpoint = await getAvailableBurstEndpoint();
+  if (!endpoint) {
+    process.stdout.write(`${AIOD_INSTALL_HINT}\n`);
+    return 0;
+  }
+  if (subcommand === 'down') {
+    const result = await teardownBurst({ binary: endpoint.binary });
+    if (options.json) writeJson(result);
+    else process.stdout.write(result.destroyed ? 'Burst instance destroyed; billing stopped.\n' : 'No burst instance was tracked.\n');
+    return 0;
+  }
+
+  const controller = new AbortController();
+  const interrupts = installInterruptHandlers(controller);
+  try {
+    const activated = await activateBurstEndpoint(endpoint, options, {
+      signal: controller.signal,
+      proposalOnly: Boolean(options.dryRun),
+    });
+    if (activated.proposed) {
+      if (options.dryRun) {
+        process.stdout.write('Dry run: burst plan proposed; nothing rented.\n');
+        return 0;
+      }
+      process.stderr.write('Burst not started: this invocation was not confirmed.\n');
+      return 1;
+    }
+    const current = activated.endpoint.status;
+    if (options.json) writeJson(burstStatusResult(current));
+    else printBurstStatus(current);
+    return 0;
+  } finally {
+    interrupts.remove();
+  }
+}
+
+async function runBurstOneShot(command, endpoint, options, args) {
+  if (['ask', 'plan', 'bench'].includes(command)) {
+    requireRemoteDataOptIn(endpoint, options.allowRemoteData);
+  }
+  const controller = new AbortController();
+  const interrupts = installInterruptHandlers(controller);
+  let workingEndpoint = endpoint;
+  let shouldTeardown = false;
+  try {
+    const activated = await activateBurstEndpoint(endpoint, options, {
+      signal: controller.signal,
+    });
+    if (activated.proposed) {
+      process.stderr.write('Burst not started: this invocation was not confirmed.\n');
+      return 1;
+    }
+    workingEndpoint = activated.endpoint;
+    shouldTeardown = true;
+    switch (command) {
+      case 'ask':
+        await askCommand(workingEndpoint, options, args, controller.signal);
+        return 0;
+      case 'plan':
+        await planCommand(workingEndpoint, options, args, controller.signal);
+        return 0;
+      case 'bench':
+        if (args.length > 0) throw new Error('bench takes no positional arguments');
+        await benchCommand(workingEndpoint, options, controller.signal);
+        return 0;
+      default:
+        throw new Error(`Command "${command}" is not a burst one-shot command`);
+    }
+  } finally {
+    try {
+      if (shouldTeardown) {
+        await teardownBurst({ binary: workingEndpoint.binary });
+      }
+    } finally {
+      interrupts.remove();
+    }
+  }
 }
 
 async function endpointsCommand(options) {
@@ -276,6 +647,7 @@ async function modelsCommand(endpoint, options) {
 }
 
 async function psCommand(endpoint, options) {
+  if (!options.burstWarningPrinted) await printCurrentBurstWarning(options);
   const report = await budget(endpoint);
   const result = { loaded: report.loaded, budget: withoutLoaded(report) };
   if (options.json) {
@@ -298,6 +670,7 @@ async function psCommand(endpoint, options) {
 }
 
 async function budgetCommand(endpoint, options) {
+  if (!options.burstWarningPrinted) await printCurrentBurstWarning(options);
   const report = await budget(endpoint);
   if (options.json) {
     writeJson(report);
@@ -320,7 +693,7 @@ async function budgetCommand(endpoint, options) {
   );
 }
 
-async function askCommand(endpoint, options, promptParts) {
+async function askCommand(endpoint, options, promptParts, signal) {
   const prompt = promptParts.join(' ');
   const result = await ask({
     endpoint,
@@ -329,6 +702,8 @@ async function askCommand(endpoint, options, promptParts) {
     model: options.model,
     uncensored: options.uncensored,
     reasoningEffort: options.reasoningEffort,
+    allowRemoteData: options.allowRemoteData,
+    signal,
   });
   if (options.json) writeJson(result);
   else process.stdout.write(`${result.response ?? ''}\n`);
@@ -356,6 +731,24 @@ function formatDuration(ms) {
   return minutes > 0 ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
 }
 
+function estimateBurstBatchMinutes(items, template) {
+  if (items.length === 0) return 1;
+  let promptTokens = 0;
+  for (let index = 0; index < items.length; index += 1) {
+    const rendered = substituteTemplate(
+      template,
+      items[index],
+      items[index][ITEM_LINE] ?? index + 1,
+    );
+    promptTokens += Math.max(1, Math.ceil(rendered.length / 4));
+  }
+  // Explicitly an assumption, used only to put an estimated runtime/cost in
+  // front of the confirmation gate. Measured planning remains `local-llm plan`.
+  const assumedCompletionTokens = 300 * items.length;
+  const assumedAggregateTokensPerSecond = 340;
+  return Math.max(1, (promptTokens + assumedCompletionTokens) / assumedAggregateTokensPerSecond / 60);
+}
+
 async function batchCommand(endpoint, options, inputFiles) {
   if (inputFiles.length !== 1) {
     throw new Error('batch requires exactly one input file');
@@ -372,35 +765,78 @@ async function batchCommand(endpoint, options, inputFiles) {
   const items = await readItems(input, { field: options.field });
   validateBatchTemplates(items, template);
   const out = options.out ?? defaultOutputPath(input);
-  const model = await resolveBatchModel(endpoint, options);
-  const admission = await admit(endpoint, model, { dryRun: Boolean(options.dryRun) });
-  if (!admission.ok) {
-    throw new Error(`Cannot admit model "${model}": ${admission.reason}`);
-  }
-
-  if (options.dryRun) {
-    const result = { model, items: items.length, out, admission };
-    if (options.json) writeJson(result);
-    else {
-      process.stdout.write(
-        `Dry run: ${items.length} items with ${model}; admission action: ${admission.action}; output: ${out}\n`,
-      );
+  let workingEndpoint = endpoint;
+  let model = null;
+  if (options.overflow != null && !isBurstEndpoint(workingEndpoint)) {
+    model = await resolveBatchModel(workingEndpoint, options);
+    const selected = await selectOverflowEndpoint({
+      endpoint: workingEndpoint,
+      model,
+      overflow: options.overflow,
+    });
+    if (selected.unavailable) {
+      process.stdout.write(`${selected.reason}\n`);
+      return 0;
     }
-    return 0;
+    workingEndpoint = selected.endpoint;
+  } else if (options.overflow != null && options.overflow !== 'burst') {
+    throw new Error(`Unsupported --overflow target "${options.overflow}"; only "burst" is available`);
   }
 
+  const burst = isBurstEndpoint(workingEndpoint);
+  if (burst && !options.dryRun) {
+    // Check before provisioning: permission discovered after spin would still
+    // spend money, even though the items were ultimately refused.
+    requireRemoteDataOptIn(workingEndpoint, options.allowRemoteData);
+  }
   const controller = new AbortController();
-  let interrupted = false;
+  const interrupts = installInterruptHandlers(controller);
   let renderedProgress = false;
-  const onSigint = () => {
-    interrupted = true;
-    controller.abort();
-  };
-  process.once('SIGINT', onSigint);
+  let shouldTeardown = false;
   let summary;
   try {
+    if (burst) {
+      const activated = await activateBurstEndpoint(workingEndpoint, options, {
+        estimatedRuntimeMinutes: estimateBurstBatchMinutes(items, template),
+        model,
+        signal: controller.signal,
+        proposalOnly: Boolean(options.dryRun),
+      });
+      if (activated.proposed) {
+        if (options.dryRun) {
+          process.stdout.write('Dry run: burst plan proposed; nothing rented and no data sent.\n');
+          return 0;
+        }
+        process.stderr.write('Burst not started: this invocation was not confirmed.\n');
+        return 1;
+      }
+      workingEndpoint = activated.endpoint;
+      // A dry-run never owns an already-live instance and must not destroy it.
+      shouldTeardown = !options.dryRun;
+    }
+
+    model = options.model ?? model ?? workingEndpoint.model;
+    if (!model) model = await resolveBatchModel(workingEndpoint, options);
+    const admission = await admit(workingEndpoint, model, {
+      dryRun: Boolean(options.dryRun),
+    });
+    if (!admission.ok) {
+      throw new Error(`Cannot admit model "${model}": ${admission.reason}`);
+    }
+
+    if (options.dryRun) {
+      const result = { model, items: items.length, out, admission };
+      if (options.json) writeJson(result);
+      else {
+        process.stdout.write(
+          `Dry run: ${items.length} items with ${model}; admission action: ${admission.action}; output: ${out}\n`,
+        );
+      }
+      return 0;
+    }
+
     summary = await runBatch({
-      endpoint,
+      endpoint: workingEndpoint,
       model,
       template,
       system,
@@ -413,6 +849,7 @@ async function batchCommand(endpoint, options, inputFiles) {
         : null,
       restart: options.restart,
       signal: controller.signal,
+      allowRemoteData: options.allowRemoteData,
       onProgress: options.json
         ? undefined
         : (progress) => {
@@ -423,8 +860,14 @@ async function batchCommand(endpoint, options, inputFiles) {
         },
     });
   } finally {
-    process.removeListener('SIGINT', onSigint);
-    if (renderedProgress) process.stderr.write('\n');
+    try {
+      if (renderedProgress) process.stderr.write('\n');
+      if (shouldTeardown) {
+        await teardownBurst({ binary: workingEndpoint.binary });
+      }
+    } finally {
+      interrupts.remove();
+    }
   }
 
   if (options.json) writeJson({ model, ...summary });
@@ -433,9 +876,9 @@ async function batchCommand(endpoint, options, inputFiles) {
       `Batch complete: ${summary.done}/${summary.total}, ${summary.ok} ok, ${summary.failed} failed. Output: ${out}\n`,
     );
   }
-  if (interrupted || summary.stopped) {
+  if (interrupts.signal || summary.stopped) {
     process.stderr.write(`Stopped safely. Resume with the same command and --out ${out}\n`);
-    return 130;
+    return interrupts.signal === 'SIGTERM' ? 143 : 130;
   }
   return 0;
 }
@@ -450,7 +893,7 @@ function formatSeconds(seconds) {
   return `~${total}s`;
 }
 
-async function planCommand(endpoint, options, args) {
+async function planCommand(endpoint, options, args, signal) {
   if (args.length !== 1) throw new Error('plan requires exactly one input file');
   if (Boolean(options.template) === Boolean(options.prompt)) {
     throw new Error('plan requires exactly one of --template <file> or --prompt <text>');
@@ -476,12 +919,66 @@ async function planCommand(endpoint, options, args) {
       ? String(options.allow).split(',').map((v) => v.trim()).filter(Boolean)
       : null,
     reasoningEffort: options.reasoningEffort,
+    allowRemoteData: options.allowRemoteData,
+    signal,
     sample: !options.noSample,
     ...(timingSampleSize == null ? {} : { timingSampleSize }),
   });
+  let comparison = null;
+  if (!isBurstEndpoint(endpoint)) {
+    try {
+      const candidate = await getAvailableBurstEndpoint();
+      if (candidate) {
+        const profile = options.profile ?? candidate.profile ?? 'qwen3-coder-30b';
+        const cached = await readThroughput();
+        const measured = [
+          candidate.model,
+          profile,
+        ]
+          .filter(Boolean)
+          .map((id) => cached[throughputKey('burst', id)])
+          .find((entry) => (
+            entry?.warning == null
+            && Number.isFinite(Number(entry?.aggregateTokPerSec))
+            && Number(entry.aggregateTokPerSec) > 0
+          ));
+        const tokPerSec = measured
+          ? Number(measured.aggregateTokPerSec)
+          : ASSUMED_BURST_TOK_PER_SEC;
+        const rateSource = measured
+          ? `measured (bench ${measured.measuredAt ?? 'earlier'})`
+          : `assumed default (${ASSUMED_BURST_TOK_PER_SEC} tok/s aggregate)`;
+        const estimatedRuntimeMinutes = Math.max(1 / 60, plan.totalTokens / tokPerSec / 60);
+        const proposal = await proposeBurst(
+          {
+            profile,
+            quant: options.quant ?? candidate.quant ?? 'fp8',
+            maxPrice: numericOption(options, 'maxPrice') ?? candidate.maxPricePerHour ?? 3,
+            // Planning is read-only and cannot spin. These are stated launch
+            // assumptions for costing the proposal, never saved defaults.
+            idle: numericOption(options, 'idle', { integer: true }) ?? 20,
+            ttl: numericOption(options, 'ttl') ?? 2,
+            estimatedRuntimeMinutes,
+          },
+          { binary: candidate.binary, signal },
+        );
+        if (proposal.available) {
+          comparison = buildBurstComparison(plan, proposal.plan, {
+            tokPerSec,
+            rateSource,
+          });
+        }
+      }
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      // A comparison is optional when aiod or its offer source is currently
+      // unavailable. The local plan remains useful and burst simply does not
+      // appear, matching optional endpoint discovery.
+    }
+  }
 
   if (options.json) {
-    writeJson(plan);
+    writeJson(comparison == null ? plan : { ...plan, comparison });
     return;
   }
   process.stdout.write(
@@ -494,6 +991,25 @@ async function planCommand(endpoint, options, args) {
       `  ETA:                 ${formatSeconds(plan.etaSeconds)} (${plan.etaMethod})`,
     ].join('\n') + '\n',
   );
+  if (comparison) {
+    const saved = comparison.timeSavedSeconds == null
+      ? null
+      : Math.max(0, comparison.timeSavedSeconds);
+    process.stdout.write(
+      [
+        '',
+        'Local vs burst (all time and cost figures are estimates)',
+        `  local  ${comparison.local.model}  ${formatSeconds(comparison.local.etaSeconds)}  $0.00`,
+        `         basis: ${comparison.local.basis}`,
+        `  burst  ${comparison.burst.model} on ${comparison.burst.gpu}  ${formatSeconds(comparison.burst.etaSeconds)}  ~$${comparison.burst.estimatedCost.toFixed(2)}`,
+        `         ${comparison.burst.tokPerSec.toFixed(1)} tok/s aggregate (${comparison.burst.rateSource}); $${comparison.burst.pricePerHour.toFixed(2)}/hr`,
+        `         planning limits: idle ${comparison.burst.idleMinutes}m, TTL ${comparison.burst.ttlHours}h`,
+        ...(saved == null
+          ? []
+          : [`  → burst saves ${formatSeconds(saved)} for about $${comparison.burst.estimatedCost.toFixed(2)} (estimate)`]),
+      ].join('\n') + '\n',
+    );
+  }
 }
 
 function positiveIntegerOption(options, name) {
@@ -505,11 +1021,18 @@ function positiveIntegerOption(options, name) {
   return value;
 }
 
-async function benchCommand(endpoint, options) {
+async function benchCommand(endpoint, options, signal) {
   const model = await resolveBatchModel(endpoint, options);
   const maxTokens = positiveIntegerOption(options, 'maxTokens');
   const runs = positiveIntegerOption(options, 'runs');
-  const result = await runBench({ endpoint, model, maxTokens, runs });
+  const result = await runBench({
+    endpoint,
+    model,
+    maxTokens,
+    runs,
+    allowRemoteData: options.allowRemoteData,
+    signal,
+  });
   const cachePath = await recordThroughput(result);
 
   if (options.json) {
@@ -589,6 +1112,29 @@ export async function main(argv = process.argv.slice(2)) {
   }
 
   const [command, ...args] = positionals;
+  if (command === 'burst') {
+    return burstCommand(options, args);
+  }
+  if (command === 'status') {
+    if (args.length > 0) throw new Error('status takes no positional arguments');
+    const current = await burstStatus();
+    if (!current.available) {
+      if (options.json) writeJson({ burst: { available: false, running: false } });
+      else process.stdout.write('No burst instance live; aiod is not installed.\n');
+      return 0;
+    }
+    if (options.json) {
+      const warning = burstWarning(current)
+        ?? (current.statusUnknown
+          ? `!!! BURST BILLING STATUS UNKNOWN — ${current.error ?? 'check the provider console immediately'} !!!`
+          : null);
+      if (warning) process.stderr.write(`${warning}\n`);
+      writeJson({ burst: burstStatusResult(current) });
+    } else {
+      printBurstStatus(current);
+    }
+    return 0;
+  }
   // `endpoints` reports on the whole registry, so it must not require a
   // resolvable default endpoint first.
   if (command === 'endpoints') {
@@ -596,7 +1142,25 @@ export async function main(argv = process.argv.slice(2)) {
     await endpointsCommand(options);
     return 0;
   }
-  const endpoint = await chooseEndpoint(options.endpoint);
+  // Billing visibility must not depend on the free/local endpoint registry
+  // being healthy. Print this before default endpoint resolution.
+  if (command === 'ps' || command === 'budget') {
+    await printCurrentBurstWarning(options);
+    options.burstWarningPrinted = true;
+  }
+  let endpoint;
+  if (options.endpoint === 'burst') {
+    endpoint = await getAvailableBurstEndpoint();
+    if (!endpoint) {
+      process.stdout.write(`${AIOD_INSTALL_HINT}\n`);
+      return 0;
+    }
+  } else {
+    endpoint = await chooseEndpoint(options.endpoint);
+  }
+  if (isBurstEndpoint(endpoint) && ['ask', 'plan', 'bench'].includes(command)) {
+    return runBurstOneShot(command, endpoint, options, args);
+  }
   switch (command) {
     case 'models':
       if (args.length > 0) throw new Error('models takes no positional arguments');
