@@ -24,6 +24,7 @@ import {
 } from './batch.mjs';
 import { planBatch } from './plan.mjs';
 import { recordThroughput, runBench } from './bench.mjs';
+import { checkUpdates } from './updates.mjs';
 
 const VERSION = '1.0.0';
 const VALUE_OPTIONS = new Set([
@@ -50,6 +51,7 @@ const BOOLEAN_OPTIONS = new Set([
   'dry-run',
   'all',
   'no-sample',
+  'check-updates',
   'help',
   'version',
 ]);
@@ -58,7 +60,7 @@ const HELP = `local-llm ${VERSION}
 
 Usage:
   local-llm endpoints [--json]
-  local-llm models [--fit] [--class <c>] [--json]
+  local-llm models [--fit] [--class <c>] [--check-updates] [--json]
   local-llm ps [--json]
   local-llm budget [--json]
   local-llm ask <prompt…> [--class c] [--model m] [--uncensored]
@@ -203,6 +205,36 @@ async function endpointsCommand(options) {
 }
 
 async function modelsCommand(endpoint, options) {
+  if (options.checkUpdates) {
+    const result = await checkUpdates(endpoint, options);
+    if (options.json) {
+      writeJson(result);
+      return;
+    }
+    if (!result.ok) {
+      process.stdout.write(`${result.message}\n`);
+      return;
+    }
+    process.stdout.write(`Endpoint: ${endpoint.id} (${endpoint.baseUrl})\n`);
+    process.stdout.write(`Updates: ${result.disclaimer}\n`);
+    if (result.cached) process.stdout.write('(served from 24h cache)\n');
+    printRows(result.updates, [
+      { label: 'MODEL', value: (row) => row.id },
+      { label: 'STATUS', value: (row) => row.status },
+      { label: 'FORMAT', value: (row) => row.format },
+      { label: 'QUANT', value: (row) => row.quant },
+      { label: 'SIZE', value: (row) => roundGb(row.sizeGb) },
+      { label: 'DOWNLOADS', value: (row) => String(row.downloads) },
+      {
+        label: 'INSTALLED',
+        value: (row) => (row.status === 'newer-quant'
+          ? `${row.installedId} (${row.installedQuant ?? 'unknown quant'})`
+          : '-'),
+      },
+    ]);
+    return;
+  }
+
   let models = await resolve(endpoint).listModels(endpoint);
   if (options.class) {
     const preferred = JOB_CLASSES[options.class];

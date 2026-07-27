@@ -94,7 +94,7 @@ No package install step is otherwise required.
 ## Commands
 
 ```text
-local-llm models [--fit] [--class <c>] [--json]
+local-llm models [--fit] [--class <c>] [--check-updates] [--json]
 local-llm ps [--json]
 local-llm budget [--json]
 local-llm ask <prompt…> [--class c] [--model m] [--uncensored] [--json]
@@ -133,6 +133,16 @@ be registered in `~/.config/local-llm/endpoints.json`:
 
 `control` can be `cli`, `jit`, or `none`. Only `cli` endpoints can be
 explicitly loaded or evicted.
+
+`local-llm models --check-updates` asks the HuggingFace API which
+text-generation models (GGUF and MLX) are currently popular, keeps only the
+ones that fit this machine's memory budget — picking the largest quantisation
+that fits when a repo publishes several — and flags newer quantisations of
+models already installed. The output is labelled "new and trending, ranked by
+downloads — not a quality judgement": popularity is not quality, and the tool
+does not claim otherwise. Results are cached for 24h in
+`~/.cache/local-llm/updates.json`, and any network failure degrades to a
+one-line message with exit code 0.
 
 ## Worked batch example
 
