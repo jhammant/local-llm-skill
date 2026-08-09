@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# pre-commit-tool-output.sh — per M9 build-output discipline (ob-84d.9).
+#
+# Lives in ~/.git-hooks/ (set via global core.hooksPath). Either invoke
+# directly as the pre-commit hook or source from a multi-step pre-commit.
+#
+# Checks, in order:
+#   0. Main-branch guard: block direct commits on main/master — policy
+#      is topic branch + PR (global CLAUDE.md / codex AGENTS.md).
+#   1. Secret detection: gitleaks protect --staged (block).
+#   2. Large files >5MB (block; use Git LFS).
+#   3. Merge conflict markers <<<<<<< / >>>>>>> (block).
+#   4. Forbidden files (.env, keys, build artifacts — warn only).
+#   5. Content-signature gate: if a staged file under .tool-output/ has
+#      the same sha256 as HEAD's version, unstage it. Prevents repo
+#      bloat from re-committing unchanged output.
+#   6. Selective-staging block: if any source file is staged but no
+#      .tool-output/ file is staged AND .tool-output/ exists in the
+#      repo, warn the operator. Blocks the commit if the repo's
+#      .beads/metadata.json indicates it has been AA-enrolled for >24h.
+#   7. Project-local hook delegation (.git/hooks/pre-commit.local or
+#      the pre-commit framework), since core.hooksPath bypasses them.
+#
+# Sections 1-4 and 7 were merged from the legacy ~/.git-hooks/pre-commit
+# (claude-bf2) when core.hooksPath was repointed here.
+
+set -euo pipefail
+
+# --- 7. Project-local hook delegation (defined early, called at exits) --
+
+# core.hooksPath bypasses per-repo .git/hooks, so honor a repo-local hook
+# or the pre-commit framework explicitly. Husky repos set their own
+# core.hooksPath (local config wins), so they never reach this hook.
+run_project_local_hooks() {
+    if [[ -x ".git/hooks/pre-commit.local" ]]; then
+        if ! .git/hooks/pre-commit.local; then
+            echo "pre-commit: BLOCKED — .git/hooks/pre-commit.local failed." >&2
+            exit 1
+        fi
+    elif [[ -f ".pre-commit-config.yaml" ]] && command -v pre-commit >/dev/null 2>&1; then
+        if ! pre-commit run --staged; then
+            echo "pre-commit: BLOCKED — pre-commit framework checks failed." >&2
+            exit 1
+        fi
+    fi
+}
+
+# --- 0. Main-branch guard ----------------------------------------------
+
+# Enforced for every agent and human on this machine (claude, codex, …).
+# Exceptions:
+#   - beads snapshots: every staged file lives under .beads/
+#   - initial commit (unborn HEAD) during repo bootstrap
+#   - repos without an origin remote (nothing to PR against)
+#   - BOH_ALLOW_MAIN=1 for deliberate one-offs; document why in the
+#     commit message and note it — same rules as --no-verify.
+branch=$(git symbolic-ref --quiet --short HEAD || true)
+if [[ "$branch" == "main" || "$branch" == "master" ]] \
+    && [[ "${BOH_ALLOW_MAIN:-0}" != "1" ]] \
+    && git rev-parse --quiet --verify HEAD >/dev/null \
+    && git remote get-url origin >/dev/null 2>&1; then
+
+    non_beads=$(git diff --cached --name-only \
+        | { grep -vE '^\.beads/' || true; } | wc -l | tr -d ' ')
+
+    if [[ "$non_beads" -gt 0 ]]; then
+        cat >&2 <<'EOF'
+pre-commit: BLOCKED — direct commit to main.
+  Policy: changes go via topic branch + PR (global CLAUDE.md / AGENTS.md).
+    git checkout -b feature/<name>    # or bugfix/ docs/ refactor/ chore/
+  Only commits touching nothing outside .beads/ may land on main directly.
+  Deliberate override (discouraged): BOH_ALLOW_MAIN=1 git commit ...
+EOF
+        exit 1
+    fi
+fi
+
+# --- 1. Secret detection (gitleaks) ------------------------------------
+
+if command -v gitleaks >/dev/null 2>&1; then
+    if ! gitleaks_out=$(gitleaks protect --staged --redact --verbose 2>&1); then
+        printf '%s\n' "$gitleaks_out" | tail -30 >&2
+        echo "pre-commit: BLOCKED — staged secrets detected (gitleaks, redacted above)." >&2
+        exit 1
+    fi
+fi
+
+# --- 2. Large file check (>5MB) -----------------------------------------
+
+large_files=$(git diff --cached --name-only --diff-filter=d | while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
+    if (( size > 5242880 )); then
+        echo "  $f ($(( size / 1048576 ))MB)"
+    fi
+done)
+if [[ -n "$large_files" ]]; then
+    {
+        echo "pre-commit: BLOCKED — staged files over 5MB:"
+        printf '%s\n' "$large_files"
+        echo "  Use Git LFS: git lfs track \"*.ext\""
+    } >&2
+    exit 1
+fi
+
+# --- 3. Merge conflict markers ------------------------------------------
+
+# Match <<<<<<< / >>>>>>> only; bare ======= false-positives on
+# Markdown/RST underlines and real conflicts always carry the other two.
+conflict_files=$(git diff --cached --name-only --diff-filter=d \
+    | xargs -r grep -lE '^(<{7}|>{7})( |$)' -- 2>/dev/null || true)
+if [[ -n "$conflict_files" ]]; then
+    {
+        echo "pre-commit: BLOCKED — unresolved merge conflict markers in:"
+        printf '%s\n' "$conflict_files" | sed 's/^/  /'
+    } >&2
+    exit 1
+fi
+
+# --- 4. Forbidden files (warn only) --------------------------------------
+
+forbidden=$(git diff --cached --name-only | grep -E \
+    '(^|/)(\.env(\..+)?|id_rsa|id_ed25519|\.DS_Store|Thumbs\.db)$|\.(pem|key|log|pyc|apk|aab|ipa)$|(^|/)(node_modules|__pycache__|\.gradle|build)/' \
+    2>/dev/null || true)
+if [[ -n "$forbidden" ]]; then
+    {
+        echo "pre-commit: WARNING — potentially sensitive/unnecessary files staged:"
+        printf '%s\n' "$forbidden" | sed 's/^/  /'
+        echo "  Consider .gitignore (warning only, not blocking)."
+    } >&2
+fi
+
+# --- 5. Content-signature gate ----------------------------------------
+
+# List staged files under .tool-output/
+mapfile -t staged_tool_output < <(
+    git diff --cached --name-only --diff-filter=AM -- '.tool-output/' 2>/dev/null || true
+)
+
+unstaged_count=0
+for f in "${staged_tool_output[@]}"; do
+    [[ -z "$f" ]] && continue
+    [[ -f "$f" ]] || continue
+
+    # Get the staged blob's sha and HEAD's blob sha for the same path
+    staged_sha=$(git ls-files -s -- "$f" 2>/dev/null | awk '{print $2}')
+    head_sha=$(git rev-parse --quiet --verify "HEAD:$f" 2>/dev/null || echo "")
+
+    if [[ -n "$staged_sha" && -n "$head_sha" && "$staged_sha" == "$head_sha" ]]; then
+        # Unchanged from HEAD — unstage
+        git restore --staged "$f" >/dev/null 2>&1 || true
+        unstaged_count=$((unstaged_count + 1))
+    fi
+done
+
+if [[ $unstaged_count -gt 0 ]]; then
+    echo "pre-commit-tool-output: unstaged $unstaged_count unchanged .tool-output/ file(s)"
+fi
+
+# --- 6. Selective-staging warning -------------------------------------
+
+# Check if .tool-output/ exists in the repo at all
+if [[ ! -d ".tool-output" ]]; then
+    run_project_local_hooks
+    exit 0
+fi
+
+# Count staged source vs .tool-output/ files (after the gate above).
+# NOTE: grep returns 1 when it filters out every line (e.g. a beads-only
+# commit). Under `set -euo pipefail` that aborts the whole hook with no
+# message, silently blocking legitimate commits — so tolerate it with
+# `|| true`. The pipeline's stdout (wc's count) is unaffected.
+staged_source=$(git diff --cached --name-only --diff-filter=AM 2>/dev/null \
+    | { grep -vE '^(\.tool-output/|\.beads/|MEMORY\.md$)' || true; } \
+    | wc -l | tr -d ' ')
+
+staged_output=$(git diff --cached --name-only --diff-filter=AM -- '.tool-output/' 2>/dev/null \
+    | wc -l | tr -d ' ')
+
+# If source changes but no fresh tool output → suspicious
+if [[ "$staged_source" -gt 0 && "$staged_output" -eq 0 ]]; then
+    # Find the most-recent .tool-output/ commit timestamp
+    last_output_ts=$(git log -1 --format=%ct -- .tool-output/ 2>/dev/null || echo "0")
+    now_ts=$(date +%s)
+    age_hours=$(( (now_ts - last_output_ts) / 3600 ))
+
+    if [[ "$age_hours" -gt 1 ]]; then
+        cat >&2 <<EOF
+pre-commit-tool-output: WARNING — staging source changes without fresh tool output.
+  Last .tool-output/ commit was ${age_hours}h ago.
+  Did your build run linters? See docs/build-output-discipline.md (M9).
+  To proceed anyway: 'git commit --no-verify' (discouraged; see global agent rules).
+EOF
+        # Block-after-24h logic: check if the repo has a beads metadata file
+        # AND that file is older than 24h
+        if [[ -f ".beads/metadata.json" ]]; then
+            beads_age_h=$(( ($(date +%s) - $(stat -c %Y .beads/metadata.json 2>/dev/null || echo "$(date +%s)")) / 3600 ))
+            if [[ "$beads_age_h" -gt 24 ]]; then
+                echo "pre-commit-tool-output: repo enrolled >24h; blocking. Run your build first." >&2
+                exit 1
+            fi
+        fi
+    fi
+fi
+
+run_project_local_hooks
+exit 0
+
+# --- BEGIN BEADS INTEGRATION v1.1.0 ---
+# This section is managed by beads. Do not remove these markers.
+if command -v bd >/dev/null 2>&1; then
+  export BD_GIT_HOOK=1
+  _bd_timeout=${BEADS_HOOK_TIMEOUT:-300}
+  _bd_used_perl=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_bd_timeout" bd hooks run pre-commit "$@"
+    _bd_exit=$?
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$_bd_timeout" bd hooks run pre-commit "$@"
+    _bd_exit=$?
+  elif command -v perl >/dev/null 2>&1; then
+    _bd_used_perl=1
+    perl -e 'alarm shift; exec @ARGV' "$_bd_timeout" bd hooks run pre-commit "$@"
+    _bd_exit=$?
+  else
+    echo >&2 "beads: hook 'pre-commit' running without timeout; install coreutils or perl to enable BEADS_HOOK_TIMEOUT"
+    bd hooks run pre-commit "$@"
+    _bd_exit=$?
+  fi
+  if [ $_bd_exit -eq 124 ] || { [ $_bd_used_perl -eq 1 ] && [ $_bd_exit -eq 142 ]; }; then
+    echo >&2 "beads: hook 'pre-commit' timed out after ${_bd_timeout}s — continuing without beads"
+    _bd_exit=0
+  fi
+  if [ $_bd_exit -eq 3 ]; then
+    echo >&2 "beads: database not initialized — skipping hook 'pre-commit'"
+    _bd_exit=0
+  fi
+  if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi
+fi
+# --- END BEADS INTEGRATION v1.1.0 ---
