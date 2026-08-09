@@ -82,10 +82,24 @@ LM Studio, so existing configs keep working.
 
 ## Install
 
-From this directory:
+Run `npm link` from a checkout that will not move or be deleted. The link
+dangles if the clone is somewhere transient such as `/tmp`, and `local-llm`
+then fails with exit 127. Clone somewhere durable, such as `~/tools` or
+`~/src`.
 
 ```sh
 npm link
+```
+
+To avoid global npm state entirely, use a plain symlink. The package declares
+zero runtime dependencies.
+
+```sh
+chmod +x src/cli.mjs
+ln -sfn "$PWD/src/cli.mjs" ~/.local/bin/local-llm
+```
+
+```sh
 local-llm --version
 ```
 
