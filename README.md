@@ -334,3 +334,18 @@ npm test
 
 Tests use injected clients and temporary state. They do not contact a network
 endpoint or execute the real `lms` binary.
+
+## Codex skill
+
+The existing skill and CLI can also be used from Codex. After completing the
+CLI setup above, run this from the repository root:
+
+```bash
+mkdir -p "$HOME/.agents/skills"
+ln -s "$PWD/skill" "$HOME/.agents/skills/local-llm"
+```
+
+Start a new Codex conversation and invoke `$local-llm`. If the destination already
+exists, inspect it and move it aside before installing; do not overwrite another
+installation. The symlink tracks this checkout, so keep the checkout in place.
+This uses the same scripts and data rather than a renamed copy of the skill.
