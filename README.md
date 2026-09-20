@@ -82,10 +82,28 @@ LM Studio, so existing configs keep working.
 
 ## Install
 
-From this directory:
+Run `npm link` from a checkout that will not move or be deleted. The link
+dangles if the clone is somewhere transient such as `/tmp`, and `local-llm`
+then fails with exit 127. Clone somewhere durable, such as `~/tools` or
+`~/src`.
 
 ```sh
 npm link
+```
+
+To avoid global npm state entirely, use a plain symlink instead. The package
+declares zero runtime dependencies. The same durability rule applies — a
+symlink dangles exactly as `npm link` does if the checkout goes away.
+
+```sh
+mkdir -p ~/.local/bin      # not present on a stock macOS
+ln -sfn "$PWD/src/cli.mjs" ~/.local/bin/local-llm
+```
+
+`~/.local/bin` is not on the default macOS `PATH`. Add it if the command comes
+back "not found".
+
+```sh
 local-llm --version
 ```
 
